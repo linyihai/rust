@@ -3,7 +3,7 @@ use std::hash::Hash;
 use std::ops::Deref;
 
 use rustc_ast_ir::Movability;
-use rustc_index::bit_set::BitSet;
+use rustc_index::bit_set::DenseBitSet;
 use smallvec::SmallVec;
 
 use crate::fold::TypeFoldable;
@@ -13,7 +13,7 @@ use crate::lang_items::TraitSolverLangItem;
 use crate::relate::Relate;
 use crate::solve::{CanonicalInput, ExternalConstraintsData, PredefinedOpaquesData, QueryResult};
 use crate::visit::{Flags, TypeSuperVisitable, TypeVisitable};
-use crate::{self as ty, TypingMode, search_graph};
+use crate::{self as ty, search_graph};
 
 pub trait Interner:
     Sized
@@ -112,8 +112,9 @@ pub trait Interner:
     type PlaceholderConst: PlaceholderLike;
     type ParamConst: Copy + Debug + Hash + Eq + ParamLike;
     type BoundConst: Copy + Debug + Hash + Eq + BoundVarLike<Self>;
-    type ValueConst: Copy + Debug + Hash + Eq;
+    type ValueConst: ValueConst<Self>;
     type ExprConst: ExprConst<Self>;
+    type ValTree: Copy + Debug + Hash + Eq;
 
     // Kinds of regions
     type Region: Region<Self>;
@@ -139,6 +140,12 @@ pub trait Interner:
 
     type VariancesOf: Copy + Debug + SliceLike<Item = ty::Variance>;
     fn variances_of(self, def_id: Self::DefId) -> Self::VariancesOf;
+
+    fn opt_alias_variances(
+        self,
+        kind: impl Into<ty::AliasTermKind>,
+        def_id: Self::DefId,
+    ) -> Option<Self::VariancesOf>;
 
     fn type_of(self, def_id: Self::DefId) -> ty::EarlyBinder<Self, Self::Ty>;
 
@@ -182,10 +189,10 @@ pub trait Interner:
     type Features: Features<Self>;
     fn features(self) -> Self::Features;
 
-    fn bound_coroutine_hidden_types(
+    fn coroutine_hidden_types(
         self,
         def_id: Self::DefId,
-    ) -> impl IntoIterator<Item = ty::EarlyBinder<Self, ty::Binder<Self, Self::Ty>>>;
+    ) -> ty::EarlyBinder<Self, ty::Binder<Self, Self::Tys>>;
 
     fn fn_sig(
         self,
@@ -199,6 +206,16 @@ pub trait Interner:
     fn generics_require_sized_self(self, def_id: Self::DefId) -> bool;
 
     fn item_bounds(
+        self,
+        def_id: Self::DefId,
+    ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>>;
+
+    fn item_self_bounds(
+        self,
+        def_id: Self::DefId,
+    ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>>;
+
+    fn item_non_self_bounds(
         self,
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>>;
@@ -223,12 +240,14 @@ pub trait Interner:
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = (Self::Clause, Self::Span)>>;
 
-    fn is_const_impl(self, def_id: Self::DefId) -> bool;
+    fn impl_is_const(self, def_id: Self::DefId) -> bool;
+    fn fn_is_const(self, def_id: Self::DefId) -> bool;
+    fn alias_has_const_conditions(self, def_id: Self::DefId) -> bool;
     fn const_conditions(
         self,
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = ty::Binder<Self, ty::TraitRef<Self>>>>;
-    fn implied_const_bounds(
+    fn explicit_implied_const_bounds(
         self,
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = ty::Binder<Self, ty::TraitRef<Self>>>>;
@@ -260,6 +279,8 @@ pub trait Interner:
 
     fn trait_is_auto(self, trait_def_id: Self::DefId) -> bool;
 
+    fn trait_is_coinductive(self, trait_def_id: Self::DefId) -> bool;
+
     fn trait_is_alias(self, trait_def_id: Self::DefId) -> bool;
 
     fn trait_is_dyn_compatible(self, trait_def_id: Self::DefId) -> bool;
@@ -267,6 +288,9 @@ pub trait Interner:
     fn trait_is_fundamental(self, def_id: Self::DefId) -> bool;
 
     fn trait_may_be_implemented_via_object(self, trait_def_id: Self::DefId) -> bool;
+
+    /// Returns `true` if this is an `unsafe trait`.
+    fn trait_is_unsafe(self, trait_def_id: Self::DefId) -> bool;
 
     fn is_impl_trait_in_trait(self, def_id: Self::DefId) -> bool;
 
@@ -277,14 +301,7 @@ pub trait Interner:
     fn coroutine_is_gen(self, coroutine_def_id: Self::DefId) -> bool;
     fn coroutine_is_async_gen(self, coroutine_def_id: Self::DefId) -> bool;
 
-    fn layout_is_pointer_like(
-        self,
-        typing_mode: TypingMode<Self>,
-        param_env: Self::ParamEnv,
-        ty: Self::Ty,
-    ) -> bool;
-
-    type UnsizingParams: Deref<Target = BitSet<u32>>;
+    type UnsizingParams: Deref<Target = DenseBitSet<u32>>;
     fn unsizing_params_for_adt(self, adt_def_id: Self::DefId) -> Self::UnsizingParams;
 
     fn find_const_ty_from_env(

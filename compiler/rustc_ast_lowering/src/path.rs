@@ -1,19 +1,19 @@
+use std::sync::Arc;
+
 use rustc_ast::{self as ast, *};
-use rustc_data_structures::sync::Lrc;
 use rustc_hir as hir;
 use rustc_hir::GenericArg;
 use rustc_hir::def::{DefKind, PartialRes, Res};
 use rustc_hir::def_id::DefId;
 use rustc_middle::span_bug;
 use rustc_session::parse::add_feature_diagnostics;
-use rustc_span::symbol::{Ident, kw, sym};
-use rustc_span::{BytePos, DUMMY_SP, DesugaringKind, Span, Symbol};
+use rustc_span::{BytePos, DUMMY_SP, DesugaringKind, Ident, Span, Symbol, kw, sym};
 use smallvec::{SmallVec, smallvec};
 use tracing::{debug, instrument};
 
 use super::errors::{
     AsyncBoundNotOnTrait, AsyncBoundOnlyForFnTraits, BadReturnTypeNotation,
-    GenericTypeWithParentheses, UseAngleBrackets,
+    GenericTypeWithParentheses, RTNSuggestion, UseAngleBrackets,
 };
 use super::{
     AllowReturnTypeNotation, GenericArgsCtor, GenericArgsMode, ImplTraitContext, ImplTraitPosition,
@@ -73,7 +73,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         let bound_modifier_allowed_features = if let Res::Def(DefKind::Trait, async_def_id) = res
             && self.tcx.async_fn_trait_kind_from_def_id(async_def_id).is_some()
         {
-            Some(Lrc::clone(&self.allow_async_fn_traits))
+            Some(Arc::clone(&self.allow_async_fn_traits))
         } else {
             None
         };
@@ -258,7 +258,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         // Additional features ungated with a bound modifier like `async`.
         // This is passed down to the implicit associated type binding in
         // parenthesized bounds.
-        bound_modifier_allowed_features: Option<Lrc<[Symbol]>>,
+        bound_modifier_allowed_features: Option<Arc<[Symbol]>>,
     ) -> hir::PathSegment<'hir> {
         debug!("path_span: {:?}, lower_path_segment(segment: {:?})", path_span, segment);
         let (mut generic_args, infer_args) = if let Some(generic_args) = segment.args.as_deref() {
@@ -268,19 +268,27 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 }
                 GenericArgs::Parenthesized(data) => match generic_args_mode {
                     GenericArgsMode::ReturnTypeNotation => {
-                        let mut err = if !data.inputs.is_empty() {
-                            self.dcx().create_err(BadReturnTypeNotation::Inputs {
-                                span: data.inputs_span,
-                            })
-                        } else if let FnRetTy::Ty(ty) = &data.output {
-                            self.dcx().create_err(BadReturnTypeNotation::Output {
-                                span: data.inputs_span.shrink_to_hi().to(ty.span),
-                            })
-                        } else {
-                            self.dcx().create_err(BadReturnTypeNotation::NeedsDots {
-                                span: data.inputs_span,
-                            })
+                        tracing::info!(?data, ?data.inputs);
+                        let err = match (&data.inputs[..], &data.output) {
+                            ([_, ..], FnRetTy::Default(_)) => {
+                                BadReturnTypeNotation::Inputs { span: data.inputs_span }
+                            }
+                            ([], FnRetTy::Default(_)) => {
+                                BadReturnTypeNotation::NeedsDots { span: data.inputs_span }
+                            }
+                            // The case `T: Trait<method(..) -> Ret>` is handled in the parser.
+                            (_, FnRetTy::Ty(ty)) => {
+                                let span = data.inputs_span.shrink_to_hi().to(ty.span);
+                                BadReturnTypeNotation::Output {
+                                    span,
+                                    suggestion: RTNSuggestion {
+                                        output: span,
+                                        input: data.inputs_span,
+                                    },
+                                }
+                            }
                         };
+                        let mut err = self.dcx().create_err(err);
                         if !self.tcx.features().return_type_notation()
                             && self.tcx.sess.is_nightly_build()
                         {
@@ -491,7 +499,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         &mut self,
         data: &ParenthesizedArgs,
         itctx: ImplTraitContext,
-        bound_modifier_allowed_features: Option<Lrc<[Symbol]>>,
+        bound_modifier_allowed_features: Option<Arc<[Symbol]>>,
     ) -> (GenericArgsCtor<'hir>, bool) {
         // Switch to `PassThrough` mode for anonymous lifetimes; this
         // means that we permit things like `&Ref<T>`, where `Ref` has
@@ -526,7 +534,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             }
             FnRetTy::Default(_) => self.arena.alloc(self.ty_tup(*span, &[])),
         };
-        let args = smallvec![GenericArg::Type(self.arena.alloc(self.ty_tup(*inputs_span, inputs)))];
+        let args = smallvec![GenericArg::Type(
+            self.arena.alloc(self.ty_tup(*inputs_span, inputs)).try_as_ambig_ty().unwrap()
+        )];
 
         // If we have a bound like `async Fn() -> T`, make sure that we mark the
         // `Output = T` associated type bound with the right feature gates.

@@ -1,6 +1,6 @@
 use super::TRANSMUTE_FLOAT_TO_INT;
-use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::sugg;
 use rustc_ast as ast;
 use rustc_errors::Applicability;
@@ -17,11 +17,11 @@ pub(super) fn check<'tcx>(
     to_ty: Ty<'tcx>,
     mut arg: &'tcx Expr<'_>,
     const_context: bool,
-    msrv: &Msrv,
+    msrv: Msrv,
 ) -> bool {
     match (&from_ty.kind(), &to_ty.kind()) {
         (ty::Float(float_ty), ty::Int(_) | ty::Uint(_))
-            if !const_context || msrv.meets(msrvs::CONST_FLOAT_BITS_CONV) =>
+            if !const_context || msrv.meets(cx, msrvs::CONST_FLOAT_BITS_CONV) =>
         {
             span_lint_and_then(
                 cx,

@@ -197,6 +197,7 @@ pub(crate) mod rustc {
             match err {
                 LayoutError::Unknown(..)
                 | LayoutError::ReferencesError(..)
+                | LayoutError::TooGeneric(..)
                 | LayoutError::NormalizationFailure(..) => Self::UnknownLayout,
                 LayoutError::SizeOverflow(..) => Self::SizeOverflow,
                 LayoutError::Cycle(err) => Self::TypeError(*err),
@@ -236,7 +237,7 @@ pub(crate) mod rustc {
 
                 ty::Tuple(members) => Self::from_tuple((ty, layout), members, cx),
 
-                ty::Array(inner_ty, len) => {
+                ty::Array(inner_ty, _len) => {
                     let FieldsShape::Array { stride, count } = &layout.fields else {
                         return Err(Err::NotYetSupported);
                     };
@@ -281,7 +282,6 @@ pub(crate) mod rustc {
                 FieldsShape::Primitive => {
                     assert_eq!(members.len(), 1);
                     let inner_ty = members[0];
-                    let inner_layout = layout_of(cx, inner_ty)?;
                     Self::from_ty(inner_ty, cx)
                 }
                 FieldsShape::Arbitrary { offsets, .. } => {
@@ -319,40 +319,32 @@ pub(crate) mod rustc {
         ) -> Result<Self, Err> {
             assert!(def.is_enum());
 
-            // Computes the variant of a given index.
-            let layout_of_variant = |index, encoding: Option<TagEncoding<VariantIdx>>| {
-                let tag = cx.tcx().tag_for_variant((cx.tcx().erase_regions(ty), index));
-                let variant_def = Def::Variant(def.variant(index));
-                let variant_layout = ty_variant(cx, (ty, layout), index);
-                Self::from_variant(
-                    variant_def,
-                    tag.map(|tag| (tag, index, encoding.unwrap())),
-                    (ty, variant_layout),
-                    layout.size,
-                    cx,
-                )
-            };
+            // Computes the layout of a variant.
+            let layout_of_variant =
+                |index, encoding: Option<TagEncoding<VariantIdx>>| -> Result<Self, Err> {
+                    let variant_layout = ty_variant(cx, (ty, layout), index);
+                    if variant_layout.is_uninhabited() {
+                        return Ok(Self::uninhabited());
+                    }
+                    let tag = cx.tcx().tag_for_variant((cx.tcx().erase_regions(ty), index));
+                    let variant_def = Def::Variant(def.variant(index));
+                    Self::from_variant(
+                        variant_def,
+                        tag.map(|tag| (tag, index, encoding.unwrap())),
+                        (ty, variant_layout),
+                        layout.size,
+                        cx,
+                    )
+                };
 
-            // We consider three kinds of enums, each demanding a different
-            // treatment of their layout computation:
-            // 1. enums that are uninhabited ZSTs
-            // 2. enums that delegate their layout to a variant
-            // 3. enums with multiple variants
             match layout.variants() {
-                Variants::Single { .. } if layout.is_uninhabited() && layout.size == Size::ZERO => {
-                    // The layout representation of uninhabited, ZST enums is
-                    // defined to be like that of the `!` type, as opposed of a
-                    // typical enum. Consequently, they cannot be descended into
-                    // as if they typical enums. We therefore special-case this
-                    // scenario and simply return an uninhabited `Tree`.
-                    Ok(Self::uninhabited())
-                }
+                Variants::Empty => Ok(Self::uninhabited()),
                 Variants::Single { index } => {
                     // `Variants::Single` on enums with variants denotes that
                     // the enum delegates its layout to the variant at `index`.
                     layout_of_variant(*index, None)
                 }
-                Variants::Multiple { tag, tag_encoding, tag_field, .. } => {
+                Variants::Multiple { tag: _, tag_encoding, tag_field, .. } => {
                     // `Variants::Multiple` denotes an enum with multiple
                     // variants. The layout of such an enum is the disjunction
                     // of the layouts of its tagged variants.
@@ -363,13 +355,13 @@ pub(crate) mod rustc {
 
                     let variants = def.discriminants(cx.tcx()).try_fold(
                         Self::uninhabited(),
-                        |variants, (idx, ref discriminant)| {
+                        |variants, (idx, _discriminant)| {
                             let variant = layout_of_variant(idx, Some(tag_encoding.clone()))?;
                             Result::<Self, Err>::Ok(variants.or(variant))
                         },
                     )?;
 
-                    return Ok(Self::def(Def::Adt(def)).then(variants));
+                    Ok(Self::def(Def::Adt(def)).then(variants))
                 }
             }
         }
@@ -421,7 +413,7 @@ pub(crate) mod rustc {
 
             // Append the fields, in memory order, to the layout.
             let inverse_memory_index = memory_index.invert_bijective_mapping();
-            for (memory_idx, &field_idx) in inverse_memory_index.iter_enumerated() {
+            for &field_idx in inverse_memory_index.iter() {
                 // Add interfield padding.
                 let padding_needed = offsets[field_idx] - size;
                 let padding = Self::padding(padding_needed.bytes_usize());
@@ -475,15 +467,14 @@ pub(crate) mod rustc {
 
             // This constructor does not support non-`FieldsShape::Union`
             // layouts. Fields of this shape are all placed at offset 0.
-            let FieldsShape::Union(fields) = layout.fields() else {
+            let FieldsShape::Union(_fields) = layout.fields() else {
                 return Err(Err::NotYetSupported);
             };
 
             let fields = &def.non_enum_variant().fields;
             let fields = fields.iter_enumerated().try_fold(
                 Self::uninhabited(),
-                |fields, (idx, field_def)| {
-                    let field_def = Def::Field(field_def);
+                |fields, (idx, _field_def)| {
                     let field_ty = ty_field(cx, (ty, layout), idx);
                     let field_layout = layout_of(cx, field_ty)?;
                     let field = Self::from_ty(field_ty, cx)?;
@@ -503,6 +494,10 @@ pub(crate) mod rustc {
         (ty, layout): (Ty<'tcx>, Layout<'tcx>),
         i: FieldIdx,
     ) -> Ty<'tcx> {
+        // We cannot use `ty_and_layout_field` to retrieve the field type, since
+        // `ty_and_layout_field` erases regions in the returned type. We must
+        // not erase regions here, since we may need to ultimately emit outlives
+        // obligations as a consequence of the transmutability analysis.
         match ty.kind() {
             ty::Adt(def, args) => {
                 match layout.variants {
@@ -510,6 +505,7 @@ pub(crate) mod rustc {
                         let field = &def.variant(index).fields[i];
                         field.ty(cx.tcx(), args)
                     }
+                    Variants::Empty => panic!("there is no field in Variants::Empty types"),
                     // Discriminant field for enums (where applicable).
                     Variants::Multiple { tag, .. } => {
                         assert_eq!(i.as_usize(), 0);

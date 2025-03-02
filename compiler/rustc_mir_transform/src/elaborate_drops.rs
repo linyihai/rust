@@ -2,23 +2,21 @@ use std::fmt;
 
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_index::IndexVec;
-use rustc_index::bit_set::BitSet;
-use rustc_infer::traits::Reveal;
-use rustc_middle::mir::patch::MirPatch;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_mir_dataflow::elaborate_drops::{
-    DropElaborator, DropFlagMode, DropFlagState, DropStyle, Unwind, elaborate_drop,
-};
 use rustc_mir_dataflow::impls::{MaybeInitializedPlaces, MaybeUninitializedPlaces};
 use rustc_mir_dataflow::move_paths::{LookupResult, MoveData, MovePathIndex};
 use rustc_mir_dataflow::{
-    Analysis, MoveDataParamEnv, ResultsCursor, on_all_children_bits, on_lookup_result_bits,
+    Analysis, DropFlagState, MoveDataTypingEnv, ResultsCursor, on_all_children_bits,
+    on_lookup_result_bits,
 };
 use rustc_span::Span;
 use tracing::{debug, instrument};
 
 use crate::deref_separator::deref_finder;
+use crate::elaborate_drop::{DropElaborator, DropFlagMode, DropStyle, Unwind, elaborate_drop};
+use crate::patch::MirPatch;
 
 /// During MIR building, Drop terminators are inserted in every place where a drop may occur.
 /// However, in this phase, the presence of these terminators does not guarantee that a destructor
@@ -61,7 +59,7 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
         // init/uninit for types that do need dropping.
         let move_data = MoveData::gather_moves(body, tcx, |ty| ty.needs_drop(tcx, typing_env));
         let elaborate_patch = {
-            let env = MoveDataParamEnv { move_data, param_env: typing_env.param_env };
+            let env = MoveDataTypingEnv { move_data, typing_env };
 
             let mut inits = MaybeInitializedPlaces::new(tcx, body, &env.move_data)
                 .skipping_unreachable_unwind()
@@ -89,6 +87,10 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
         elaborate_patch.apply(body);
         deref_finder(tcx, body);
     }
+
+    fn is_required(&self) -> bool {
+        true
+    }
 }
 
 /// Records unwind edges which are known to be unreachable, because they are in `drop` terminators
@@ -97,10 +99,10 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
 fn compute_dead_unwinds<'a, 'tcx>(
     body: &'a Body<'tcx>,
     flow_inits: &mut ResultsCursor<'a, 'tcx, MaybeInitializedPlaces<'a, 'tcx>>,
-) -> BitSet<BasicBlock> {
+) -> DenseBitSet<BasicBlock> {
     // We only need to do this pass once, because unwind edges can only
     // reach cleanup blocks, which can't have unwind edges themselves.
-    let mut dead_unwinds = BitSet::new_empty(body.basic_blocks.len());
+    let mut dead_unwinds = DenseBitSet::new_empty(body.basic_blocks.len());
     for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
         let TerminatorKind::Drop { place, unwind: UnwindAction::Cleanup(_), .. } =
             bb_data.terminator().kind
@@ -128,13 +130,17 @@ impl InitializationData<'_, '_> {
         self.uninits.seek_before_primary_effect(loc);
     }
 
-    fn maybe_live_dead(&self, path: MovePathIndex) -> (bool, bool) {
+    fn maybe_init_uninit(&self, path: MovePathIndex) -> (bool, bool) {
         (self.inits.get().contains(path), self.uninits.get().contains(path))
     }
 }
 
 impl<'a, 'tcx> DropElaborator<'a, 'tcx> for ElaborateDropsCtxt<'a, 'tcx> {
     type Path = MovePathIndex;
+
+    fn patch_ref(&self) -> &MirPatch<'tcx> {
+        &self.patch
+    }
 
     fn patch(&mut self) -> &mut MirPatch<'tcx> {
         &mut self.patch
@@ -149,28 +155,28 @@ impl<'a, 'tcx> DropElaborator<'a, 'tcx> for ElaborateDropsCtxt<'a, 'tcx> {
     }
 
     fn typing_env(&self) -> ty::TypingEnv<'tcx> {
-        self.typing_env()
+        self.env.typing_env
     }
 
     #[instrument(level = "debug", skip(self), ret)]
     fn drop_style(&self, path: Self::Path, mode: DropFlagMode) -> DropStyle {
-        let ((maybe_live, maybe_dead), multipart) = match mode {
-            DropFlagMode::Shallow => (self.init_data.maybe_live_dead(path), false),
+        let ((maybe_init, maybe_uninit), multipart) = match mode {
+            DropFlagMode::Shallow => (self.init_data.maybe_init_uninit(path), false),
             DropFlagMode::Deep => {
-                let mut some_live = false;
-                let mut some_dead = false;
+                let mut some_maybe_init = false;
+                let mut some_maybe_uninit = false;
                 let mut children_count = 0;
                 on_all_children_bits(self.move_data(), path, |child| {
-                    let (live, dead) = self.init_data.maybe_live_dead(child);
-                    debug!("elaborate_drop: state({:?}) = {:?}", child, (live, dead));
-                    some_live |= live;
-                    some_dead |= dead;
+                    let (maybe_init, maybe_uninit) = self.init_data.maybe_init_uninit(child);
+                    debug!("elaborate_drop: state({:?}) = {:?}", child, (maybe_init, maybe_uninit));
+                    some_maybe_init |= maybe_init;
+                    some_maybe_uninit |= maybe_uninit;
                     children_count += 1;
                 });
-                ((some_live, some_dead), children_count != 1)
+                ((some_maybe_init, some_maybe_uninit), children_count != 1)
             }
         };
-        match (maybe_live, maybe_dead, multipart) {
+        match (maybe_init, maybe_uninit, multipart) {
             (false, _, _) => DropStyle::Dead,
             (true, false, _) => DropStyle::Static,
             (true, true, false) => DropStyle::Conditional,
@@ -230,7 +236,7 @@ impl<'a, 'tcx> DropElaborator<'a, 'tcx> for ElaborateDropsCtxt<'a, 'tcx> {
 struct ElaborateDropsCtxt<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     body: &'a Body<'tcx>,
-    env: &'a MoveDataParamEnv<'tcx>,
+    env: &'a MoveDataTypingEnv<'tcx>,
     init_data: InitializationData<'a, 'tcx>,
     drop_flags: IndexVec<MovePathIndex, Option<Local>>,
     patch: MirPatch<'tcx>,
@@ -245,15 +251,6 @@ impl fmt::Debug for ElaborateDropsCtxt<'_, '_> {
 impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
     fn move_data(&self) -> &'a MoveData<'tcx> {
         &self.env.move_data
-    }
-
-    fn param_env(&self) -> ty::ParamEnv<'tcx> {
-        self.env.param_env
-    }
-
-    fn typing_env(&self) -> ty::TypingEnv<'tcx> {
-        debug_assert_eq!(self.param_env().reveal(), Reveal::All);
-        ty::TypingEnv { typing_mode: ty::TypingMode::PostAnalysis, param_env: self.param_env() }
     }
 
     fn create_drop_flag(&mut self, index: MovePathIndex, span: Span) {
@@ -293,15 +290,15 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
                 LookupResult::Exact(path) => {
                     self.init_data.seek_before(self.body.terminator_loc(bb));
                     on_all_children_bits(self.move_data(), path, |child| {
-                        let (maybe_live, maybe_dead) = self.init_data.maybe_live_dead(child);
+                        let (maybe_init, maybe_uninit) = self.init_data.maybe_init_uninit(child);
                         debug!(
                             "collect_drop_flags: collecting {:?} from {:?}@{:?} - {:?}",
                             child,
                             place,
                             path,
-                            (maybe_live, maybe_dead)
+                            (maybe_init, maybe_uninit)
                         );
-                        if maybe_live && maybe_dead {
+                        if maybe_init && maybe_uninit {
                             self.create_drop_flag(child, terminator.source_info.span)
                         }
                     });
@@ -313,8 +310,8 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
                     }
 
                     self.init_data.seek_before(self.body.terminator_loc(bb));
-                    let (_maybe_live, maybe_dead) = self.init_data.maybe_live_dead(parent);
-                    if maybe_dead {
+                    let (_maybe_init, maybe_uninit) = self.init_data.maybe_init_uninit(parent);
+                    if maybe_uninit {
                         self.tcx.dcx().span_delayed_bug(
                             terminator.source_info.span,
                             format!(
@@ -420,7 +417,7 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
                 ..
             } = data.terminator().kind
             {
-                assert!(!self.patch.is_patched(bb));
+                assert!(!self.patch.is_term_patched(bb));
 
                 let loc = Location { block: tgt, statement_index: 0 };
                 let path = self.move_data().rev_lookup.find(destination.as_ref());
@@ -465,7 +462,7 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
                             // a Goto; see `MirPatch::new`).
                         }
                         _ => {
-                            assert!(!self.patch.is_patched(bb));
+                            assert!(!self.patch.is_term_patched(bb));
                         }
                     }
                 }
@@ -489,7 +486,7 @@ impl<'a, 'tcx> ElaborateDropsCtxt<'a, 'tcx> {
                 ..
             } = data.terminator().kind
             {
-                assert!(!self.patch.is_patched(bb));
+                assert!(!self.patch.is_term_patched(bb));
 
                 let loc = Location { block: bb, statement_index: data.statements.len() };
                 let path = self.move_data().rev_lookup.find(destination.as_ref());

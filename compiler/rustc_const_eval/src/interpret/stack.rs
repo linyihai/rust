@@ -10,7 +10,7 @@ use rustc_index::IndexVec;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::{bug, mir};
-use rustc_mir_dataflow::storage::always_storage_live_locals;
+use rustc_mir_dataflow::impls::always_storage_live_locals;
 use rustc_span::Span;
 use tracing::{info_span, instrument, trace};
 
@@ -231,13 +231,19 @@ impl<'tcx> FrameInfo<'tcx> {
     pub fn as_note(&self, tcx: TyCtxt<'tcx>) -> errors::FrameNote {
         let span = self.span;
         if tcx.def_key(self.instance.def_id()).disambiguated_data.data == DefPathData::Closure {
-            errors::FrameNote { where_: "closure", span, instance: String::new(), times: 0 }
+            errors::FrameNote {
+                where_: "closure",
+                span,
+                instance: String::new(),
+                times: 0,
+                has_label: false,
+            }
         } else {
             let instance = format!("{}", self.instance);
             // Note: this triggers a `must_produce_diag` state, which means that if we ever get
             // here we must emit a diagnostic. We should never display a `FrameInfo` unless we
             // actually want to emit a warning or error to the user.
-            errors::FrameNote { where_: "instance", span, instance, times: 0 }
+            errors::FrameNote { where_: "instance", span, instance, times: 0, has_label: false }
         }
     }
 }
@@ -505,6 +511,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 // We don't want to do any queries, so there is not much we can do with ADTs.
                 ty::Adt(..) => false,
 
+                ty::UnsafeBinder(ty) => is_very_trivially_sized(ty.skip_binder()),
+
                 ty::Alias(..) | ty::Param(_) | ty::Placeholder(..) => false,
 
                 ty::Infer(ty::TyVar(_)) => false,
@@ -584,8 +592,10 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         interp_ok(())
     }
 
+    /// This is public because it is used by [Aquascope](https://github.com/cognitive-engineering-lab/aquascope/)
+    /// to analyze all the locals in a stack frame.
     #[inline(always)]
-    pub(super) fn layout_of_local(
+    pub fn layout_of_local(
         &self,
         frame: &Frame<'tcx, M::Provenance, M::FrameExtra>,
         local: mir::Local,

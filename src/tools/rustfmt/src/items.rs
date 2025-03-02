@@ -333,19 +333,19 @@ impl<'a> FnSig<'a> {
         defaultness: ast::Defaultness,
     ) -> FnSig<'a> {
         match *fn_kind {
-            visit::FnKind::Fn(visit::FnCtxt::Assoc(..), _, fn_sig, vis, generics, _) => {
-                let mut fn_sig = FnSig::from_method_sig(fn_sig, generics, vis);
+            visit::FnKind::Fn(visit::FnCtxt::Assoc(..), _, vis, ast::Fn { sig, generics, .. }) => {
+                let mut fn_sig = FnSig::from_method_sig(sig, generics, vis);
                 fn_sig.defaultness = defaultness;
                 fn_sig
             }
-            visit::FnKind::Fn(_, _, fn_sig, vis, generics, _) => FnSig {
+            visit::FnKind::Fn(_, _, vis, ast::Fn { sig, generics, .. }) => FnSig {
                 decl,
                 generics,
-                ext: fn_sig.header.ext,
-                constness: fn_sig.header.constness,
-                coroutine_kind: Cow::Borrowed(&fn_sig.header.coroutine_kind),
+                ext: sig.header.ext,
+                constness: sig.header.constness,
+                coroutine_kind: Cow::Borrowed(&sig.header.coroutine_kind),
                 defaultness,
-                safety: fn_sig.header.safety,
+                safety: sig.header.safety,
                 visibility: vis,
             },
             _ => unreachable!(),
@@ -1916,15 +1916,15 @@ pub(crate) fn rewrite_struct_field_prefix(
     field: &ast::FieldDef,
 ) -> RewriteResult {
     let vis = format_visibility(context, &field.vis);
+    let safety = format_safety(field.safety);
     let type_annotation_spacing = type_annotation_spacing(context.config);
     Ok(match field.ident {
         Some(name) => format!(
-            "{}{}{}:",
-            vis,
+            "{vis}{safety}{}{}:",
             rewrite_ident(context, name),
             type_annotation_spacing.0
         ),
-        None => vis.to_string(),
+        None => format!("{vis}{safety}"),
     })
 }
 
@@ -1944,6 +1944,11 @@ pub(crate) fn rewrite_struct_field(
     shape: Shape,
     lhs_max_width: usize,
 ) -> RewriteResult {
+    // FIXME(default_field_values): Implement formatting.
+    if field.default.is_some() {
+        return Err(RewriteError::Unknown);
+    }
+
     if contains_skip(&field.attrs) {
         return Ok(context.snippet(field.span()).to_owned());
     }
@@ -3448,6 +3453,7 @@ impl Rewrite for ast::ForeignItem {
                     ref sig,
                     ref generics,
                     ref body,
+                    ..
                 } = **fn_kind;
                 if body.is_some() {
                     let mut visitor = FmtVisitor::from_context(context);
@@ -3456,7 +3462,7 @@ impl Rewrite for ast::ForeignItem {
                     let inner_attrs = inner_attributes(&self.attrs);
                     let fn_ctxt = visit::FnCtxt::Foreign;
                     visitor.visit_fn(
-                        visit::FnKind::Fn(fn_ctxt, &self.ident, sig, &self.vis, generics, body),
+                        visit::FnKind::Fn(fn_ctxt, &self.ident, &self.vis, fn_kind),
                         &sig.decl,
                         self.span,
                         defaultness,
@@ -3597,7 +3603,7 @@ pub(crate) fn rewrite_extern_crate(
 pub(crate) fn is_mod_decl(item: &ast::Item) -> bool {
     !matches!(
         item.kind,
-        ast::ItemKind::Mod(_, ast::ModKind::Loaded(_, ast::Inline::Yes, _))
+        ast::ItemKind::Mod(_, ast::ModKind::Loaded(_, ast::Inline::Yes, _, _))
     )
 }
 

@@ -1,13 +1,12 @@
 use rustc_abi::{HasDataLayout, TargetDataLayout};
-use rustc_ast::Attribute;
+use rustc_hir::Attribute;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::span_bug;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutError, LayoutOfHelpers};
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_span::Span;
 use rustc_span::source_map::Spanned;
-use rustc_span::symbol::sym;
+use rustc_span::{Span, sym};
 use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
 use rustc_trait_selection::infer::TyCtxtInferExt;
 use rustc_trait_selection::traits;
@@ -113,8 +112,7 @@ fn dump_layout_of(tcx: TyCtxt<'_>, item_def_id: LocalDefId, attr: &Attribute) {
                     }
 
                     sym::debug => {
-                        let normalized_ty =
-                            format!("{}", tcx.normalize_erasing_regions(typing_env, ty));
+                        let normalized_ty = tcx.normalize_erasing_regions(typing_env, ty);
                         // FIXME: using the `Debug` impl here isn't ideal.
                         let ty_layout = format!("{:#?}", *ty_layout);
                         tcx.dcx().emit_err(LayoutOf { span, normalized_ty, ty_layout });

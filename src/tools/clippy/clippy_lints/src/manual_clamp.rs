@@ -1,8 +1,8 @@
 use clippy_config::Conf;
-use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::consts::{ConstEvalCtxt, Constant};
 use clippy_utils::diagnostics::{span_lint_and_then, span_lint_hir_and_then};
 use clippy_utils::higher::If;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::sugg::Sugg;
 use clippy_utils::ty::implements_trait;
 use clippy_utils::visitors::is_const_evaluatable;
@@ -99,9 +99,7 @@ pub struct ManualClamp {
 
 impl ManualClamp {
     pub fn new(conf: &'static Conf) -> Self {
-        Self {
-            msrv: conf.msrv.clone(),
-        }
+        Self { msrv: conf.msrv }
     }
 }
 
@@ -144,30 +142,28 @@ struct InputMinMax<'tcx> {
 
 impl<'tcx> LateLintPass<'tcx> for ManualClamp {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
-        if !self.msrv.meets(msrvs::CLAMP) {
-            return;
-        }
         if !expr.span.from_expansion() && !is_in_const_context(cx) {
             let suggestion = is_if_elseif_else_pattern(cx, expr)
                 .or_else(|| is_max_min_pattern(cx, expr))
                 .or_else(|| is_call_max_min_pattern(cx, expr))
                 .or_else(|| is_match_pattern(cx, expr))
                 .or_else(|| is_if_elseif_pattern(cx, expr));
-            if let Some(suggestion) = suggestion {
+            if let Some(suggestion) = suggestion
+                && self.msrv.meets(cx, msrvs::CLAMP)
+            {
                 maybe_emit_suggestion(cx, &suggestion);
             }
         }
     }
 
     fn check_block(&mut self, cx: &LateContext<'tcx>, block: &'tcx Block<'tcx>) {
-        if !self.msrv.meets(msrvs::CLAMP) || is_in_const_context(cx) {
+        if is_in_const_context(cx) || !self.msrv.meets(cx, msrvs::CLAMP) {
             return;
         }
         for suggestion in is_two_if_pattern(cx, block) {
             maybe_emit_suggestion(cx, &suggestion);
         }
     }
-    extract_msrv_attr!(LateContext);
 }
 
 fn maybe_emit_suggestion<'tcx>(cx: &LateContext<'tcx>, suggestion: &ClampSuggestion<'tcx>) {

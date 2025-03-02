@@ -1,5 +1,5 @@
-use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet;
 use clippy_utils::ty::is_type_diagnostic_item;
 use clippy_utils::{path_to_local_id, peel_blocks};
@@ -18,12 +18,8 @@ pub(super) fn check(
     as_ref_recv: &hir::Expr<'_>,
     map_arg: &hir::Expr<'_>,
     is_mut: bool,
-    msrv: &Msrv,
+    msrv: Msrv,
 ) {
-    if !msrv.meets(msrvs::OPTION_AS_DEREF) {
-        return;
-    }
-
     let same_mutability = |m| (is_mut && m == &hir::Mutability::Mut) || (!is_mut && m == &hir::Mutability::Not);
 
     let option_ty = cx.typeck_results().expr_ty(as_ref_recv);
@@ -54,7 +50,7 @@ pub(super) fn check(
                 })
         },
         hir::ExprKind::Closure(&hir::Closure { body, .. }) => {
-            let closure_body = cx.tcx.hir().body(body);
+            let closure_body = cx.tcx.hir_body(body);
             let closure_expr = peel_blocks(closure_body.value);
 
             match &closure_expr.kind {
@@ -93,7 +89,7 @@ pub(super) fn check(
         _ => false,
     };
 
-    if is_deref {
+    if is_deref && msrv.meets(cx, msrvs::OPTION_AS_DEREF) {
         let current_method = if is_mut {
             format!(".as_mut().map({})", snippet(cx, map_arg.span, ".."))
         } else {

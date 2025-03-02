@@ -12,11 +12,10 @@
 //!   metadata we remembered when pushing said frame.
 
 use rustc_abi::ExternAbi;
-use rustc_ast::Mutability;
 use rustc_middle::{mir, ty};
 use rustc_target::spec::PanicStrategy;
 
-use self::helpers::check_arg_count;
+use self::helpers::check_intrinsic_arg_count;
 use crate::*;
 
 /// Holds all of the relevant data for when unwinding hits a `try` frame.
@@ -78,7 +77,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // a pointer to `Box<dyn Any + Send + 'static>`.
 
         // Get all the arguments.
-        let [try_fn, data, catch_fn] = check_arg_count(args)?;
+        let [try_fn, data, catch_fn] = check_intrinsic_arg_count(args)?;
         let try_fn = this.read_pointer(try_fn)?;
         let data = this.read_immediate(data)?;
         let catch_fn = this.read_pointer(catch_fn)?;
@@ -161,7 +160,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
 
         // First arg: message.
-        let msg = this.allocate_str(msg, MiriMemoryKind::Machine.into(), Mutability::Not)?;
+        let msg = this.allocate_str_dedup(msg)?;
 
         // Call the lang item.
         let panic = this.tcx.lang_items().panic_fn().unwrap();
@@ -180,7 +179,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
 
         // First arg: message.
-        let msg = this.allocate_str(msg, MiriMemoryKind::Machine.into(), Mutability::Not)?;
+        let msg = this.allocate_str_dedup(msg)?;
 
         // Call the lang item.
         let panic = this.tcx.lang_items().panic_nounwind().unwrap();
@@ -248,10 +247,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // Call the lang item associated with this message.
                 let fn_item = this.tcx.require_lang_item(msg.panic_function(), None);
                 let instance = ty::Instance::mono(this.tcx.tcx, fn_item);
-                this.call_function(instance, ExternAbi::Rust, &[], None, StackPopCleanup::Goto {
-                    ret: None,
-                    unwind,
-                })?;
+                this.call_function(
+                    instance,
+                    ExternAbi::Rust,
+                    &[],
+                    None,
+                    StackPopCleanup::Goto { ret: None, unwind },
+                )?;
             }
         }
         interp_ok(())

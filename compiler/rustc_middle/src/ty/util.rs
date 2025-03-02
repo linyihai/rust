@@ -5,9 +5,10 @@ use std::{fmt, iter};
 use rustc_abi::{ExternAbi, Float, Integer, IntegerType, Size};
 use rustc_apfloat::Float as _;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_data_structures::stable_hasher::{Hash128, HashStable, StableHasher};
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::ErrorGuaranteed;
+use rustc_hashes::Hash128;
 use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId};
@@ -20,7 +21,9 @@ use tracing::{debug, instrument};
 
 use super::TypingEnv;
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+use crate::mir;
 use crate::query::Providers;
+use crate::ty::fold::fold_regions;
 use crate::ty::layout::{FloatExt, IntegerExt};
 use crate::ty::{
     self, Asyncness, FallibleTypeFolder, GenericArgKind, GenericArgsRef, Ty, TyCtxt, TypeFoldable,
@@ -171,6 +174,24 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
+    /// Checks whether `ty: Copy` holds while ignoring region constraints.
+    ///
+    /// This impacts whether values of `ty` are *moved* or *copied*
+    /// when referenced. This means that we may generate MIR which
+    /// does copies even when the type actually doesn't satisfy the
+    /// full requirements for the `Copy` trait (cc #29149) -- this
+    /// winds up being reported as an error during NLL borrow check.
+    ///
+    /// This function should not be used if there is an `InferCtxt` available.
+    /// Use `InferCtxt::type_is_copy_modulo_regions` instead.
+    pub fn type_is_copy_modulo_regions(
+        self,
+        typing_env: ty::TypingEnv<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        ty.is_trivially_pure_clone_copy() || self.is_copy_raw(typing_env.as_query_input(ty))
+    }
+
     /// Returns the deeply last field of nested structures, or the same type if
     /// not a structure at all. Corresponds to the only possible unsized field,
     /// and its type can be used to determine unsizing strategy.
@@ -185,6 +206,20 @@ impl<'tcx> TyCtxt<'tcx> {
     ) -> Ty<'tcx> {
         let tcx = self;
         tcx.struct_tail_raw(ty, |ty| tcx.normalize_erasing_regions(typing_env, ty), || {})
+    }
+
+    /// Returns true if a type has metadata.
+    pub fn type_has_metadata(self, ty: Ty<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> bool {
+        if ty.is_sized(self, typing_env) {
+            return false;
+        }
+
+        let tail = self.struct_tail_for_codegen(ty, typing_env);
+        match tail.kind() {
+            ty::Foreign(..) => false,
+            ty::Str | ty::Slice(..) | ty::Dynamic(..) => true,
+            _ => bug!("unexpected unsized tail: {:?}", tail),
+        }
     }
 
     /// Returns the deeply last field of nested structures, or the same type if
@@ -347,7 +382,7 @@ impl<'tcx> TyCtxt<'tcx> {
         validate: impl Fn(Self, DefId) -> Result<(), ErrorGuaranteed>,
     ) -> Option<ty::Destructor> {
         let drop_trait = self.lang_items().drop_trait()?;
-        self.ensure().coherent_trait(drop_trait).ok()?;
+        self.ensure_ok().coherent_trait(drop_trait).ok()?;
 
         let ty = self.type_of(adt_did).instantiate_identity();
         let mut dtor_candidate = None;
@@ -370,7 +405,7 @@ impl<'tcx> TyCtxt<'tcx> {
                     .delay_as_bug();
             }
 
-            dtor_candidate = Some((*item_id, self.constness(impl_did)));
+            dtor_candidate = Some((*item_id, self.impl_trait_header(impl_did).unwrap().constness));
         });
 
         let (did, constness) = dtor_candidate?;
@@ -384,7 +419,7 @@ impl<'tcx> TyCtxt<'tcx> {
         validate: impl Fn(Self, DefId) -> Result<(), ErrorGuaranteed>,
     ) -> Option<ty::AsyncDestructor> {
         let async_drop_trait = self.lang_items().async_drop_trait()?;
-        self.ensure().coherent_trait(async_drop_trait).ok()?;
+        self.ensure_ok().coherent_trait(async_drop_trait).ok()?;
 
         let ty = self.type_of(adt_did).instantiate_identity();
         let mut dtor_candidate = None;
@@ -423,8 +458,8 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn async_drop_glue_morphology(self, did: DefId) -> AsyncDropGlueMorphology {
         let ty: Ty<'tcx> = self.type_of(did).instantiate_identity();
 
-        // Async drop glue morphology is an internal detail, so reveal_all probably
-        // should be fine
+        // Async drop glue morphology is an internal detail, so
+        // using `TypingMode::PostAnalysis` probably should be fine.
         let typing_env = ty::TypingEnv::fully_monomorphized();
         if ty.needs_async_drop(self, typing_env) {
             AsyncDropGlueMorphology::Custom
@@ -705,50 +740,37 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Return the set of types that should be taken into account when checking
-    /// trait bounds on a coroutine's internal state.
-    // FIXME(compiler-errors): We should remove this when the old solver goes away;
-    // and all other usages of this function should go through `bound_coroutine_hidden_types`
-    // instead.
+    /// trait bounds on a coroutine's internal state. This properly replaces
+    /// `ReErased` with new existential bound lifetimes.
     pub fn coroutine_hidden_types(
         self,
         def_id: DefId,
-    ) -> impl Iterator<Item = ty::EarlyBinder<'tcx, Ty<'tcx>>> {
+    ) -> ty::EarlyBinder<'tcx, ty::Binder<'tcx, &'tcx ty::List<Ty<'tcx>>>> {
         let coroutine_layout = self.mir_coroutine_witnesses(def_id);
-        coroutine_layout
-            .as_ref()
-            .map_or_else(|| [].iter(), |l| l.field_tys.iter())
-            .filter(|decl| !decl.ignore_for_traits)
-            .map(|decl| ty::EarlyBinder::bind(decl.ty))
-    }
-
-    /// Return the set of types that should be taken into account when checking
-    /// trait bounds on a coroutine's internal state. This properly replaces
-    /// `ReErased` with new existential bound lifetimes.
-    pub fn bound_coroutine_hidden_types(
-        self,
-        def_id: DefId,
-    ) -> impl Iterator<Item = ty::EarlyBinder<'tcx, ty::Binder<'tcx, Ty<'tcx>>>> {
-        let coroutine_layout = self.mir_coroutine_witnesses(def_id);
-        coroutine_layout
-            .as_ref()
-            .map_or_else(|| [].iter(), |l| l.field_tys.iter())
-            .filter(|decl| !decl.ignore_for_traits)
-            .map(move |decl| {
-                let mut vars = vec![];
-                let ty = self.fold_regions(decl.ty, |re, debruijn| {
-                    assert_eq!(re, self.lifetimes.re_erased);
-                    let var = ty::BoundVar::from_usize(vars.len());
-                    vars.push(ty::BoundVariableKind::Region(ty::BoundRegionKind::Anon));
-                    ty::Region::new_bound(self, debruijn, ty::BoundRegion {
-                        var,
-                        kind: ty::BoundRegionKind::Anon,
-                    })
-                });
-                ty::EarlyBinder::bind(ty::Binder::bind_with_vars(
-                    ty,
-                    self.mk_bound_variable_kinds(&vars),
-                ))
-            })
+        let mut vars = vec![];
+        let bound_tys = self.mk_type_list_from_iter(
+            coroutine_layout
+                .as_ref()
+                .map_or_else(|| [].iter(), |l| l.field_tys.iter())
+                .filter(|decl| !decl.ignore_for_traits)
+                .map(|decl| {
+                    let ty = fold_regions(self, decl.ty, |re, debruijn| {
+                        assert_eq!(re, self.lifetimes.re_erased);
+                        let var = ty::BoundVar::from_usize(vars.len());
+                        vars.push(ty::BoundVariableKind::Region(ty::BoundRegionKind::Anon));
+                        ty::Region::new_bound(
+                            self,
+                            debruijn,
+                            ty::BoundRegion { var, kind: ty::BoundRegionKind::Anon },
+                        )
+                    });
+                    ty
+                }),
+        );
+        ty::EarlyBinder::bind(ty::Binder::bind_with_vars(
+            bound_tys,
+            self.mk_bound_variable_kinds(&vars),
+        ))
     }
 
     /// Expands the given impl trait type, stopping if the type is recursive.
@@ -757,7 +779,6 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         def_id: DefId,
         args: GenericArgsRef<'tcx>,
-        inspect_coroutine_fields: InspectCoroutineFields,
     ) -> Result<Ty<'tcx>, Ty<'tcx>> {
         let mut visitor = OpaqueTypeExpander {
             seen_opaque_tys: FxHashSet::default(),
@@ -766,9 +787,7 @@ impl<'tcx> TyCtxt<'tcx> {
             found_recursion: false,
             found_any_recursion: false,
             check_recursion: true,
-            expand_coroutines: true,
             tcx: self,
-            inspect_coroutine_fields,
         };
 
         let expanded_type = visitor.expand_opaque_ty(def_id, args).unwrap();
@@ -857,6 +876,11 @@ impl<'tcx> TyCtxt<'tcx> {
     /// [public]: TyCtxt::is_private_dep
     /// [direct]: rustc_session::cstore::ExternCrate::is_direct
     pub fn is_user_visible_dep(self, key: CrateNum) -> bool {
+        // `#![rustc_private]` overrides defaults to make private dependencies usable.
+        if self.features().enabled(sym::rustc_private) {
+            return true;
+        }
+
         // | Private | Direct | Visible |                    |
         // |---------|--------|---------|--------------------|
         // | Yes     | Yes    | Yes     | !true || true   |
@@ -926,6 +950,29 @@ impl<'tcx> TyCtxt<'tcx> {
 
         ty
     }
+
+    // Computes the variances for an alias (opaque or RPITIT) that represent
+    // its (un)captured regions.
+    pub fn opt_alias_variances(
+        self,
+        kind: impl Into<ty::AliasTermKind>,
+        def_id: DefId,
+    ) -> Option<&'tcx [ty::Variance]> {
+        match kind.into() {
+            ty::AliasTermKind::ProjectionTy => {
+                if self.is_impl_trait_in_trait(def_id) {
+                    Some(self.variances_of(def_id))
+                } else {
+                    None
+                }
+            }
+            ty::AliasTermKind::OpaqueTy => Some(self.variances_of(def_id)),
+            ty::AliasTermKind::InherentTy
+            | ty::AliasTermKind::WeakTy
+            | ty::AliasTermKind::UnevaluatedConst
+            | ty::AliasTermKind::ProjectionConst => None,
+        }
+    }
 }
 
 struct OpaqueTypeExpander<'tcx> {
@@ -940,19 +987,11 @@ struct OpaqueTypeExpander<'tcx> {
     primary_def_id: Option<DefId>,
     found_recursion: bool,
     found_any_recursion: bool,
-    expand_coroutines: bool,
     /// Whether or not to check for recursive opaque types.
     /// This is `true` when we're explicitly checking for opaque type
     /// recursion, and 'false' otherwise to avoid unnecessary work.
     check_recursion: bool,
     tcx: TyCtxt<'tcx>,
-    inspect_coroutine_fields: InspectCoroutineFields,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum InspectCoroutineFields {
-    No,
-    Yes,
 }
 
 impl<'tcx> OpaqueTypeExpander<'tcx> {
@@ -984,41 +1023,6 @@ impl<'tcx> OpaqueTypeExpander<'tcx> {
             None
         }
     }
-
-    fn expand_coroutine(&mut self, def_id: DefId, args: GenericArgsRef<'tcx>) -> Option<Ty<'tcx>> {
-        if self.found_any_recursion {
-            return None;
-        }
-        let args = args.fold_with(self);
-        if !self.check_recursion || self.seen_opaque_tys.insert(def_id) {
-            let expanded_ty = match self.expanded_cache.get(&(def_id, args)) {
-                Some(expanded_ty) => *expanded_ty,
-                None => {
-                    if matches!(self.inspect_coroutine_fields, InspectCoroutineFields::Yes) {
-                        for bty in self.tcx.bound_coroutine_hidden_types(def_id) {
-                            let hidden_ty = self.tcx.instantiate_bound_regions_with_erased(
-                                bty.instantiate(self.tcx, args),
-                            );
-                            self.fold_ty(hidden_ty);
-                        }
-                    }
-                    let expanded_ty = Ty::new_coroutine_witness(self.tcx, def_id, args);
-                    self.expanded_cache.insert((def_id, args), expanded_ty);
-                    expanded_ty
-                }
-            };
-            if self.check_recursion {
-                self.seen_opaque_tys.remove(&def_id);
-            }
-            Some(expanded_ty)
-        } else {
-            // If another opaque type that we contain is recursive, then it
-            // will report the error, so we don't have to.
-            self.found_any_recursion = true;
-            self.found_recursion = def_id == *self.primary_def_id.as_ref().unwrap();
-            None
-        }
-    }
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for OpaqueTypeExpander<'tcx> {
@@ -1027,19 +1031,13 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for OpaqueTypeExpander<'tcx> {
     }
 
     fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
-        let mut t = if let ty::Alias(ty::Opaque, ty::AliasTy { def_id, args, .. }) = *t.kind() {
+        if let ty::Alias(ty::Opaque, ty::AliasTy { def_id, args, .. }) = *t.kind() {
             self.expand_opaque_ty(def_id, args).unwrap_or(t)
-        } else if t.has_opaque_types() || t.has_coroutines() {
+        } else if t.has_opaque_types() {
             t.super_fold_with(self)
         } else {
             t
-        };
-        if self.expand_coroutines {
-            if let ty::CoroutineWitness(def_id, args) = *t.kind() {
-                t = self.expand_coroutine(def_id, args).unwrap_or(t);
-            }
         }
-        t
     }
 
     fn fold_predicate(&mut self, p: ty::Predicate<'tcx>) -> ty::Predicate<'tcx> {
@@ -1053,7 +1051,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for OpaqueTypeExpander<'tcx> {
                     // This is because for default trait methods with RPITITs, we
                     // install a `NormalizesTo(Projection(RPITIT) -> Opaque(RPITIT))`
                     // predicate, which would trivially cause a cycle when we do
-                    // anything that requires `ParamEnv::with_reveal_all_normalized`.
+                    // anything that requires `TypingEnv::with_post_analysis_normalized`.
                     term: projection_pred.term,
                 })
                 .upcast(self.tcx)
@@ -1159,33 +1157,18 @@ impl<'tcx> Ty<'tcx> {
 
     /// Returns the maximum value for the given numeric type (including `char`s)
     /// or returns `None` if the type is not numeric.
-    pub fn numeric_max_val(self, tcx: TyCtxt<'tcx>) -> Option<ty::Const<'tcx>> {
+    pub fn numeric_max_val(self, tcx: TyCtxt<'tcx>) -> Option<mir::Const<'tcx>> {
         let typing_env = TypingEnv::fully_monomorphized();
         self.numeric_min_and_max_as_bits(tcx)
-            .map(|(_, max)| ty::Const::from_bits(tcx, max, typing_env, self))
+            .map(|(_, max)| mir::Const::from_bits(tcx, max, typing_env, self))
     }
 
     /// Returns the minimum value for the given numeric type (including `char`s)
     /// or returns `None` if the type is not numeric.
-    pub fn numeric_min_val(self, tcx: TyCtxt<'tcx>) -> Option<ty::Const<'tcx>> {
+    pub fn numeric_min_val(self, tcx: TyCtxt<'tcx>) -> Option<mir::Const<'tcx>> {
         let typing_env = TypingEnv::fully_monomorphized();
         self.numeric_min_and_max_as_bits(tcx)
-            .map(|(min, _)| ty::Const::from_bits(tcx, min, typing_env, self))
-    }
-
-    /// Checks whether values of this type `T` are *moved* or *copied*
-    /// when referenced -- this amounts to a check for whether `T:
-    /// Copy`, but note that we **don't** consider lifetimes when
-    /// doing this check. This means that we may generate MIR which
-    /// does copies even when the type actually doesn't satisfy the
-    /// full requirements for the `Copy` trait (cc #29149) -- this
-    /// winds up being reported as an error during NLL borrow check.
-    pub fn is_copy_modulo_regions(
-        self,
-        tcx: TyCtxt<'tcx>,
-        typing_env: ty::TypingEnv<'tcx>,
-    ) -> bool {
-        self.is_trivially_pure_clone_copy() || tcx.is_copy_raw(typing_env.as_query_input(self))
+            .map(|(min, _)| mir::Const::from_bits(tcx, min, typing_env, self))
     }
 
     /// Checks whether values of this type `T` have a size known at
@@ -1237,6 +1220,7 @@ impl<'tcx> Ty<'tcx> {
             | ty::Foreign(_)
             | ty::Coroutine(..)
             | ty::CoroutineWitness(..)
+            | ty::UnsafeBinder(_)
             | ty::Infer(_)
             | ty::Alias(..)
             | ty::Param(_)
@@ -1277,10 +1261,20 @@ impl<'tcx> Ty<'tcx> {
             | ty::Foreign(_)
             | ty::Coroutine(..)
             | ty::CoroutineWitness(..)
+            | ty::UnsafeBinder(_)
             | ty::Infer(_)
             | ty::Alias(..)
             | ty::Param(_)
             | ty::Placeholder(_) => false,
+        }
+    }
+
+    /// Checks whether this type is an ADT that has unsafe fields.
+    pub fn has_unsafe_fields(self) -> bool {
+        if let ty::Adt(adt_def, ..) = self.kind() {
+            adt_def.all_fields().any(|x| x.safety.is_unsafe())
+        } else {
+            false
         }
     }
 
@@ -1308,6 +1302,9 @@ impl<'tcx> Ty<'tcx> {
             | ty::FnPtr(..)
             | ty::Infer(ty::FreshIntTy(_))
             | ty::Infer(ty::FreshFloatTy(_)) => AsyncDropGlueMorphology::Noop,
+
+            // FIXME(unsafe_binders):
+            ty::UnsafeBinder(_) => todo!(),
 
             ty::Tuple(tys) if tys.is_empty() => AsyncDropGlueMorphology::Noop,
             ty::Adt(adt_def, _) if adt_def.is_manually_drop() => AsyncDropGlueMorphology::Noop,
@@ -1509,7 +1506,7 @@ impl<'tcx> Ty<'tcx> {
                 false
             }
 
-            ty::Foreign(_) | ty::CoroutineWitness(..) | ty::Error(_) => false,
+            ty::Foreign(_) | ty::CoroutineWitness(..) | ty::Error(_) | ty::UnsafeBinder(_) => false,
         }
     }
 
@@ -1668,46 +1665,8 @@ pub fn needs_drop_components_with_async<'tcx>(
         | ty::Closure(..)
         | ty::CoroutineClosure(..)
         | ty::Coroutine(..)
-        | ty::CoroutineWitness(..) => Ok(smallvec![ty]),
-    }
-}
-
-pub fn is_trivially_const_drop(ty: Ty<'_>) -> bool {
-    match *ty.kind() {
-        ty::Bool
-        | ty::Char
-        | ty::Int(_)
-        | ty::Uint(_)
-        | ty::Float(_)
-        | ty::Infer(ty::IntVar(_))
-        | ty::Infer(ty::FloatVar(_))
-        | ty::Str
-        | ty::RawPtr(_, _)
-        | ty::Ref(..)
-        | ty::FnDef(..)
-        | ty::FnPtr(..)
-        | ty::Never
-        | ty::Foreign(_) => true,
-
-        ty::Alias(..)
-        | ty::Dynamic(..)
-        | ty::Error(_)
-        | ty::Bound(..)
-        | ty::Param(_)
-        | ty::Placeholder(_)
-        | ty::Infer(_) => false,
-
-        // Not trivial because they have components, and instead of looking inside,
-        // we'll just perform trait selection.
-        ty::Closure(..)
-        | ty::CoroutineClosure(..)
-        | ty::Coroutine(..)
         | ty::CoroutineWitness(..)
-        | ty::Adt(..) => false,
-
-        ty::Array(ty, _) | ty::Slice(ty) | ty::Pat(ty, _) => is_trivially_const_drop(ty),
-
-        ty::Tuple(tys) => tys.iter().all(|ty| is_trivially_const_drop(ty)),
+        | ty::UnsafeBinder(_) => Ok(smallvec![ty]),
     }
 }
 
@@ -1767,9 +1726,7 @@ pub fn reveal_opaque_types_in_bounds<'tcx>(
         found_recursion: false,
         found_any_recursion: false,
         check_recursion: false,
-        expand_coroutines: false,
         tcx,
-        inspect_coroutine_fields: InspectCoroutineFields::No,
     };
     val.fold_with(&mut visitor)
 }
@@ -1798,9 +1755,15 @@ pub fn intrinsic_raw(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<ty::Intrinsi
         && (matches!(tcx.fn_sig(def_id).skip_binder().abi(), ExternAbi::RustIntrinsic)
             || tcx.has_attr(def_id, sym::rustc_intrinsic))
     {
+        let must_be_overridden = match tcx.hir_node_by_def_id(def_id) {
+            hir::Node::Item(hir::Item { kind: hir::ItemKind::Fn { has_body, .. }, .. }) => {
+                !has_body
+            }
+            _ => true,
+        };
         Some(ty::IntrinsicDef {
             name: tcx.item_name(def_id.into()),
-            must_be_overridden: tcx.has_attr(def_id, sym::rustc_intrinsic_must_be_overridden),
+            must_be_overridden,
             const_stable: tcx.has_attr(def_id, sym::rustc_intrinsic_const_stable_indirect),
         })
     } else {
