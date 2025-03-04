@@ -15,8 +15,7 @@
 
 pub use rustc_ast_ir::visit::VisitorResult;
 pub use rustc_ast_ir::{try_visit, visit_opt, walk_list, walk_visitable_list};
-use rustc_span::Span;
-use rustc_span::symbol::Ident;
+use rustc_span::{Ident, Span};
 
 use crate::ast::*;
 use crate::ptr::P;
@@ -66,7 +65,7 @@ impl BoundKind {
 #[derive(Copy, Clone, Debug)]
 pub enum FnKind<'a> {
     /// E.g., `fn foo()`, `fn foo(&self)`, or `extern "Abi" fn foo()`.
-    Fn(FnCtxt, &'a Ident, &'a FnSig, &'a Visibility, &'a Generics, &'a Option<P<Block>>),
+    Fn(FnCtxt, &'a Ident, &'a Visibility, &'a Fn),
 
     /// E.g., `|x, y| body`.
     Closure(&'a ClosureBinder, &'a Option<CoroutineKind>, &'a FnDecl, &'a Expr),
@@ -75,7 +74,7 @@ pub enum FnKind<'a> {
 impl<'a> FnKind<'a> {
     pub fn header(&self) -> Option<&'a FnHeader> {
         match *self {
-            FnKind::Fn(_, _, sig, _, _, _) => Some(&sig.header),
+            FnKind::Fn(_, _, _, Fn { sig, .. }) => Some(&sig.header),
             FnKind::Closure(..) => None,
         }
     }
@@ -89,7 +88,7 @@ impl<'a> FnKind<'a> {
 
     pub fn decl(&self) -> &'a FnDecl {
         match self {
-            FnKind::Fn(_, _, sig, _, _, _) => &sig.decl,
+            FnKind::Fn(_, _, _, Fn { sig, .. }) => &sig.decl,
             FnKind::Closure(_, _, decl, _) => decl,
         }
     }
@@ -180,6 +179,9 @@ pub trait Visitor<'ast>: Sized {
     fn visit_ty(&mut self, t: &'ast Ty) -> Self::Result {
         walk_ty(self, t)
     }
+    fn visit_ty_pat(&mut self, t: &'ast TyPat) -> Self::Result {
+        walk_ty_pat(self, t)
+    }
     fn visit_generic_param(&mut self, param: &'ast GenericParam) -> Self::Result {
         walk_generic_param(self, param)
     }
@@ -189,8 +191,14 @@ pub trait Visitor<'ast>: Sized {
     fn visit_closure_binder(&mut self, b: &'ast ClosureBinder) -> Self::Result {
         walk_closure_binder(self, b)
     }
+    fn visit_contract(&mut self, c: &'ast FnContract) -> Self::Result {
+        walk_contract(self, c)
+    }
     fn visit_where_predicate(&mut self, p: &'ast WherePredicate) -> Self::Result {
         walk_where_predicate(self, p)
+    }
+    fn visit_where_predicate_kind(&mut self, k: &'ast WherePredicateKind) -> Self::Result {
+        walk_where_predicate_kind(self, k)
     }
     fn visit_fn(&mut self, fk: FnKind<'ast>, _: Span, _: NodeId) -> Self::Result {
         walk_fn(self, fk)
@@ -372,12 +380,12 @@ impl WalkItemKind for ItemKind {
                 try_visit!(visitor.visit_ty(ty));
                 visit_opt!(visitor, visit_expr, expr);
             }
-            ItemKind::Fn(box Fn { defaultness: _, generics, sig, body }) => {
-                let kind = FnKind::Fn(FnCtxt::Free, ident, sig, vis, generics, body);
+            ItemKind::Fn(func) => {
+                let kind = FnKind::Fn(FnCtxt::Free, ident, vis, &*func);
                 try_visit!(visitor.visit_fn(kind, span, id));
             }
             ItemKind::Mod(_unsafety, mod_kind) => match mod_kind {
-                ModKind::Loaded(items, _inline, _inner_span) => {
+                ModKind::Loaded(items, _inline, _inner_span, _) => {
                     walk_list!(visitor, visit_item, items);
                 }
                 ModKind::Unloaded => {}
@@ -463,13 +471,6 @@ impl WalkItemKind for ItemKind {
     }
 }
 
-pub fn walk_item<'a, V: Visitor<'a>>(
-    visitor: &mut V,
-    item: &'a Item<impl WalkItemKind<Ctxt = ()>>,
-) -> V::Result {
-    walk_assoc_item(visitor, item, ())
-}
-
 pub fn walk_enum_def<'a, V: Visitor<'a>>(
     visitor: &mut V,
     EnumDef { variants }: &'a EnumDef,
@@ -526,13 +527,17 @@ pub fn walk_ty<'a, V: Visitor<'a>>(visitor: &mut V, typ: &'a Ty) -> V::Result {
             walk_list!(visitor, visit_generic_param, generic_params);
             try_visit!(visitor.visit_fn_decl(decl));
         }
+        TyKind::UnsafeBinder(binder) => {
+            walk_list!(visitor, visit_generic_param, &binder.generic_params);
+            try_visit!(visitor.visit_ty(&binder.inner_ty));
+        }
         TyKind::Path(maybe_qself, path) => {
             try_visit!(visitor.visit_qself(maybe_qself));
             try_visit!(visitor.visit_path(path, *id));
         }
         TyKind::Pat(ty, pat) => {
             try_visit!(visitor.visit_ty(ty));
-            try_visit!(visitor.visit_pat(pat));
+            try_visit!(visitor.visit_ty_pat(pat));
         }
         TyKind::Array(ty, length) => {
             try_visit!(visitor.visit_ty(ty));
@@ -549,6 +554,18 @@ pub fn walk_ty<'a, V: Visitor<'a>>(visitor: &mut V, typ: &'a Ty) -> V::Result {
         TyKind::Err(_guar) => {}
         TyKind::MacCall(mac) => try_visit!(visitor.visit_mac_call(mac)),
         TyKind::Never | TyKind::CVarArgs => {}
+    }
+    V::Result::output()
+}
+
+pub fn walk_ty_pat<'a, V: Visitor<'a>>(visitor: &mut V, tp: &'a TyPat) -> V::Result {
+    let TyPat { id: _, kind, span: _, tokens: _ } = tp;
+    match kind {
+        TyPatKind::Range(start, end, _include_end) => {
+            visit_opt!(visitor, visit_anon_const, start);
+            visit_opt!(visitor, visit_anon_const, end);
+        }
+        TyPatKind::Err(_) => {}
     }
     V::Result::output()
 }
@@ -580,7 +597,7 @@ pub fn walk_use_tree<'a, V: Visitor<'a>>(
             visit_opt!(visitor, visit_ident, rename);
         }
         UseTreeKind::Glob => {}
-        UseTreeKind::Nested { ref items, span: _ } => {
+        UseTreeKind::Nested { items, span: _ } => {
             for &(ref nested_tree, nested_id) in items {
                 try_visit!(visitor.visit_use_tree(nested_tree, nested_id, true));
             }
@@ -681,10 +698,14 @@ pub fn walk_pat<'a, V: Visitor<'a>>(visitor: &mut V, pattern: &'a Pat) -> V::Res
             try_visit!(visitor.visit_ident(ident));
             visit_opt!(visitor, visit_pat, optional_subpattern);
         }
-        PatKind::Lit(expression) => try_visit!(visitor.visit_expr(expression)),
+        PatKind::Expr(expression) => try_visit!(visitor.visit_expr(expression)),
         PatKind::Range(lower_bound, upper_bound, _end) => {
             visit_opt!(visitor, visit_expr, lower_bound);
             visit_opt!(visitor, visit_expr, upper_bound);
+        }
+        PatKind::Guard(subpattern, guard_condition) => {
+            try_visit!(visitor.visit_pat(subpattern));
+            try_visit!(visitor.visit_expr(guard_condition));
         }
         PatKind::Wild | PatKind::Rest | PatKind::Never => {}
         PatKind::Err(_guar) => {}
@@ -712,8 +733,8 @@ impl WalkItemKind for ForeignItemKind {
                 try_visit!(visitor.visit_ty(ty));
                 visit_opt!(visitor, visit_expr, expr);
             }
-            ForeignItemKind::Fn(box Fn { defaultness: _, generics, sig, body }) => {
-                let kind = FnKind::Fn(FnCtxt::Foreign, ident, sig, vis, generics, body);
+            ForeignItemKind::Fn(func) => {
+                let kind = FnKind::Fn(FnCtxt::Foreign, ident, vis, &*func);
                 try_visit!(visitor.visit_fn(kind, span, id));
             }
             ForeignItemKind::TyAlias(box TyAlias {
@@ -797,26 +818,45 @@ pub fn walk_closure_binder<'a, V: Visitor<'a>>(
     V::Result::output()
 }
 
+pub fn walk_contract<'a, V: Visitor<'a>>(visitor: &mut V, c: &'a FnContract) -> V::Result {
+    let FnContract { requires, ensures } = c;
+    if let Some(pred) = requires {
+        visitor.visit_expr(pred);
+    }
+    if let Some(pred) = ensures {
+        visitor.visit_expr(pred);
+    }
+    V::Result::output()
+}
+
 pub fn walk_where_predicate<'a, V: Visitor<'a>>(
     visitor: &mut V,
     predicate: &'a WherePredicate,
 ) -> V::Result {
-    match predicate {
-        WherePredicate::BoundPredicate(WhereBoundPredicate {
+    let WherePredicate { attrs, kind, id: _, span: _, is_placeholder: _ } = predicate;
+    walk_list!(visitor, visit_attribute, attrs);
+    visitor.visit_where_predicate_kind(kind)
+}
+
+pub fn walk_where_predicate_kind<'a, V: Visitor<'a>>(
+    visitor: &mut V,
+    kind: &'a WherePredicateKind,
+) -> V::Result {
+    match kind {
+        WherePredicateKind::BoundPredicate(WhereBoundPredicate {
             bounded_ty,
             bounds,
             bound_generic_params,
-            span: _,
         }) => {
             walk_list!(visitor, visit_generic_param, bound_generic_params);
             try_visit!(visitor.visit_ty(bounded_ty));
             walk_list!(visitor, visit_param_bound, bounds, BoundKind::Bound);
         }
-        WherePredicate::RegionPredicate(WhereRegionPredicate { lifetime, bounds, span: _ }) => {
+        WherePredicateKind::RegionPredicate(WhereRegionPredicate { lifetime, bounds }) => {
             try_visit!(visitor.visit_lifetime(lifetime, LifetimeCtxt::Bound));
             walk_list!(visitor, visit_param_bound, bounds, BoundKind::Bound);
         }
-        WherePredicate::EqPredicate(WhereEqPredicate { lhs_ty, rhs_ty, span: _ }) => {
+        WherePredicateKind::EqPredicate(WhereEqPredicate { lhs_ty, rhs_ty }) => {
             try_visit!(visitor.visit_ty(lhs_ty));
             try_visit!(visitor.visit_ty(rhs_ty));
         }
@@ -848,11 +888,17 @@ pub fn walk_fn_decl<'a, V: Visitor<'a>>(
 
 pub fn walk_fn<'a, V: Visitor<'a>>(visitor: &mut V, kind: FnKind<'a>) -> V::Result {
     match kind {
-        FnKind::Fn(_ctxt, _ident, FnSig { header, decl, span: _ }, _vis, generics, body) => {
+        FnKind::Fn(
+            _ctxt,
+            _ident,
+            _vis,
+            Fn { defaultness: _, sig: FnSig { header, decl, span: _ }, generics, contract, body },
+        ) => {
             // Identifier and visibility are visited as a part of the item.
             try_visit!(visitor.visit_fn_header(header));
             try_visit!(visitor.visit_generics(generics));
             try_visit!(visitor.visit_fn_decl(decl));
+            visit_opt!(visitor, visit_contract, contract);
             visit_opt!(visitor, visit_block, body);
         }
         FnKind::Closure(binder, coroutine_kind, decl, body) => {
@@ -882,8 +928,8 @@ impl WalkItemKind for AssocItemKind {
                 try_visit!(visitor.visit_ty(ty));
                 visit_opt!(visitor, visit_expr, expr);
             }
-            AssocItemKind::Fn(box Fn { defaultness: _, generics, sig, body }) => {
-                let kind = FnKind::Fn(FnCtxt::Assoc(ctxt), ident, sig, vis, generics, body);
+            AssocItemKind::Fn(func) => {
+                let kind = FnKind::Fn(FnCtxt::Assoc(ctxt), ident, vis, &*func);
                 try_visit!(visitor.visit_fn(kind, span, id));
             }
             AssocItemKind::Type(box TyAlias {
@@ -931,7 +977,22 @@ impl WalkItemKind for AssocItemKind {
     }
 }
 
-pub fn walk_assoc_item<'a, V: Visitor<'a>, K: WalkItemKind>(
+pub fn walk_item<'a, V: Visitor<'a>>(
+    visitor: &mut V,
+    item: &'a Item<impl WalkItemKind<Ctxt = ()>>,
+) -> V::Result {
+    walk_item_ctxt(visitor, item, ())
+}
+
+pub fn walk_assoc_item<'a, V: Visitor<'a>>(
+    visitor: &mut V,
+    item: &'a AssocItem,
+    ctxt: AssocCtxt,
+) -> V::Result {
+    walk_item_ctxt(visitor, item, ctxt)
+}
+
+fn walk_item_ctxt<'a, V: Visitor<'a>, K: WalkItemKind>(
     visitor: &mut V,
     item: &'a Item<K>,
     ctxt: K::Ctxt,
@@ -953,11 +1014,13 @@ pub fn walk_struct_def<'a, V: Visitor<'a>>(
 }
 
 pub fn walk_field_def<'a, V: Visitor<'a>>(visitor: &mut V, field: &'a FieldDef) -> V::Result {
-    let FieldDef { attrs, id: _, span: _, vis, ident, ty, is_placeholder: _ } = field;
+    let FieldDef { attrs, id: _, span: _, vis, ident, ty, is_placeholder: _, safety: _, default } =
+        field;
     walk_list!(visitor, visit_attribute, attrs);
     try_visit!(visitor.visit_vis(vis));
     visit_opt!(visitor, visit_ident, ident);
     try_visit!(visitor.visit_ty(ty));
+    visit_opt!(visitor, visit_anon_const, &*default);
     V::Result::output()
 }
 
@@ -1034,7 +1097,7 @@ pub fn walk_inline_asm_sym<'a, V: Visitor<'a>>(
 }
 
 pub fn walk_format_args<'a, V: Visitor<'a>>(visitor: &mut V, fmt: &'a FormatArgs) -> V::Result {
-    let FormatArgs { span: _, template: _, arguments } = fmt;
+    let FormatArgs { span: _, template: _, arguments, uncooked_fmt_str: _ } = fmt;
     for FormatArgument { kind, expr } in arguments.all_args() {
         match kind {
             FormatArgumentKind::Named(ident) | FormatArgumentKind::Captured(ident) => {
@@ -1202,6 +1265,10 @@ pub fn walk_expr<'a, V: Visitor<'a>>(visitor: &mut V, expression: &'a Expr) -> V
         ExprKind::TryBlock(body) => try_visit!(visitor.visit_block(body)),
         ExprKind::Lit(_token) => {}
         ExprKind::IncludedBytes(_bytes) => {}
+        ExprKind::UnsafeBinderCast(_kind, expr, ty) => {
+            try_visit!(visitor.visit_expr(expr));
+            visit_opt!(visitor, visit_ty, ty);
+        }
         ExprKind::Err(_guar) => {}
         ExprKind::Dummy => {}
     }
@@ -1255,10 +1322,7 @@ pub fn walk_attr_args<'a, V: Visitor<'a>>(visitor: &mut V, args: &'a AttrArgs) -
     match args {
         AttrArgs::Empty => {}
         AttrArgs::Delimited(_args) => {}
-        AttrArgs::Eq(_eq_span, AttrArgsEq::Ast(expr)) => try_visit!(visitor.visit_expr(expr)),
-        AttrArgs::Eq(_eq_span, AttrArgsEq::Hir(lit)) => {
-            unreachable!("in literal form when walking mac args eq: {:?}", lit)
-        }
+        AttrArgs::Eq { expr, .. } => try_visit!(visitor.visit_expr(expr)),
     }
     V::Result::output()
 }

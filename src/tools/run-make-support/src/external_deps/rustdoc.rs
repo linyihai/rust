@@ -45,8 +45,7 @@ impl Rustdoc {
     #[track_caller]
     pub fn new() -> Self {
         let mut cmd = setup_common();
-        let target_rpath_dir = env_var_os("TARGET_RPATH_DIR");
-        cmd.arg(format!("-L{}", target_rpath_dir.to_string_lossy()));
+        cmd.arg("-L").arg(env_var_os("TARGET_RPATH_DIR"));
         Self { cmd }
     }
 
@@ -131,6 +130,13 @@ impl Rustdoc {
     pub fn output_format(&mut self, format: &str) -> &mut Self {
         self.cmd.arg("--output-format");
         self.cmd.arg(format);
+        self
+    }
+
+    /// Specify type(s) of output files to generate.
+    pub fn emit<S: AsRef<str>>(&mut self, kinds: S) -> &mut Self {
+        let kinds = kinds.as_ref();
+        self.cmd.arg(format!("--emit={kinds}"));
         self
     }
 }

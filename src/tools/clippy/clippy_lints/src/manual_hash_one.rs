@@ -1,6 +1,6 @@
 use clippy_config::Conf;
-use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_hir_and_then;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::SpanRangeExt;
 use clippy_utils::visitors::{is_local_used, local_used_once};
 use clippy_utils::{is_trait_method, path_to_local_id};
@@ -53,9 +53,7 @@ pub struct ManualHashOne {
 
 impl ManualHashOne {
     pub fn new(conf: &'static Conf) -> Self {
-        Self {
-            msrv: conf.msrv.clone(),
-        }
+        Self { msrv: conf.msrv }
     }
 }
 
@@ -98,7 +96,7 @@ impl LateLintPass<'_> for ManualHashOne {
             && let ExprKind::MethodCall(seg, _, [], _) = finish_expr.kind
             && seg.ident.name.as_str() == "finish"
 
-            && self.msrv.meets(msrvs::BUILD_HASHER_HASH_ONE)
+            && self.msrv.meets(cx, msrvs::BUILD_HASHER_HASH_ONE)
         {
             span_lint_hir_and_then(
                 cx,
@@ -129,6 +127,4 @@ impl LateLintPass<'_> for ManualHashOne {
             );
         }
     }
-
-    extract_msrv_attr!(LateContext);
 }

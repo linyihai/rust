@@ -31,20 +31,19 @@ impl<'a, 'tcx> At<'a, 'tcx> {
     /// normalized. If you don't care about regions, you should prefer
     /// `normalize_erasing_regions`, which is more efficient.
     ///
-    /// If the normalization succeeds and is unambiguous, returns back
-    /// the normalized value along with various outlives relations (in
-    /// the form of obligations that must be discharged).
+    /// If the normalization succeeds, returns back the normalized
+    /// value along with various outlives relations (in the form of
+    /// obligations that must be discharged).
     ///
-    /// N.B., this will *eventually* be the main means of
-    /// normalizing, but for now should be used only when we actually
-    /// know that normalization will succeed, since error reporting
-    /// and other details are still "under development".
-    ///
-    /// This normalization should *only* be used when the projection does not
-    /// have possible ambiguity or may not be well-formed.
+    /// This normalization should *only* be used when the projection is well-formed and
+    /// does not have possible ambiguity (contains inference variables).
     ///
     /// After codegen, when lifetimes do not matter, it is preferable to instead
     /// use [`TyCtxt::normalize_erasing_regions`], which wraps this procedure.
+    ///
+    /// N.B. Once the new solver is stabilized this method of normalization will
+    /// likely be removed as trait solver operations are already cached by the query
+    /// system making this redundant.
     fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
@@ -89,7 +88,7 @@ impl<'a, 'tcx> At<'a, 'tcx> {
             }
         }
 
-        if !needs_normalization(self.infcx, self.param_env, &value) {
+        if !needs_normalization(self.infcx, &value) {
             return Ok(Normalized { value, obligations: PredicateObligations::new() });
         }
 
@@ -191,7 +190,7 @@ impl<'a, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'a, 'tcx> {
 
     #[instrument(level = "debug", skip(self))]
     fn try_fold_ty(&mut self, ty: Ty<'tcx>) -> Result<Ty<'tcx>, Self::Error> {
-        if !needs_normalization(self.infcx, self.param_env, &ty) {
+        if !needs_normalization(self.infcx, &ty) {
             return Ok(ty);
         }
 
@@ -210,15 +209,13 @@ impl<'a, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'a, 'tcx> {
 
         // See note in `rustc_trait_selection::traits::project` about why we
         // wait to fold the args.
-
-        // Wrap this in a closure so we don't accidentally return from the outer function
         let res = match kind {
             ty::Opaque => {
                 // Only normalize `impl Trait` outside of type inference, usually in codegen.
-                match self.infcx.typing_mode(self.param_env) {
-                    TypingMode::Coherence | TypingMode::Analysis { defining_opaque_types: _ } => {
-                        ty.try_super_fold_with(self)?
-                    }
+                match self.infcx.typing_mode() {
+                    TypingMode::Coherence
+                    | TypingMode::Analysis { .. }
+                    | TypingMode::PostBorrowckAnalysis { .. } => ty.try_super_fold_with(self)?,
 
                     TypingMode::PostAnalysis => {
                         let args = data.args.try_fold_with(self)?;
@@ -334,7 +331,7 @@ impl<'a, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'a, 'tcx> {
         &mut self,
         constant: ty::Const<'tcx>,
     ) -> Result<ty::Const<'tcx>, Self::Error> {
-        if !needs_normalization(self.infcx, self.param_env, &constant) {
+        if !needs_normalization(self.infcx, &constant) {
             return Ok(constant);
         }
 
@@ -353,7 +350,7 @@ impl<'a, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'a, 'tcx> {
         &mut self,
         p: ty::Predicate<'tcx>,
     ) -> Result<ty::Predicate<'tcx>, Self::Error> {
-        if p.allow_normalization() && needs_normalization(self.infcx, self.param_env, &p) {
+        if p.allow_normalization() && needs_normalization(self.infcx, &p) {
             p.try_super_fold_with(self)
         } else {
             Ok(p)

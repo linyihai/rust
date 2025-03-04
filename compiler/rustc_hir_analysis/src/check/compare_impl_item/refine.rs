@@ -3,21 +3,19 @@ use rustc_data_structures::fx::FxIndexSet;
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_infer::infer::TyCtxtInferExt;
-use rustc_infer::infer::outlives::env::OutlivesEnvironment;
 use rustc_lint_defs::builtin::{REFINING_IMPL_TRAIT_INTERNAL, REFINING_IMPL_TRAIT_REACHABLE};
 use rustc_middle::span_bug;
-use rustc_middle::traits::{ObligationCause, Reveal};
+use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::{
     self, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperVisitable, TypeVisitable,
     TypeVisitableExt, TypeVisitor, TypingMode,
 };
 use rustc_span::Span;
 use rustc_trait_selection::regions::InferCtxtRegionExt;
-use rustc_trait_selection::traits::outlives_bounds::InferCtxtExt;
 use rustc_trait_selection::traits::{ObligationCtxt, elaborate, normalize_param_env_or_error};
 
 /// Check that an implementation does not refine an RPITIT from a trait method signature.
-pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
+pub(crate) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
     tcx: TyCtxt<'tcx>,
     impl_m: ty::AssocItem,
     trait_m: ty::AssocItem,
@@ -98,7 +96,7 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
 
         // This opaque also needs to be from the impl method -- otherwise,
         // it's a refinement to a TAIT.
-        if !tcx.hir().get_if_local(impl_opaque.def_id).is_some_and(|node| {
+        if !tcx.hir_get_if_local(impl_opaque.def_id).is_some_and(|node| {
             matches!(
                 node.expect_opaque_ty().origin,
                 hir::OpaqueTyOrigin::AsyncFn { parent, .. }  | hir::OpaqueTyOrigin::FnReturn { parent, .. }
@@ -134,7 +132,7 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
         .into_iter()
         .chain(tcx.predicates_of(trait_m.def_id).instantiate_own(tcx, trait_m_to_impl_m_args))
         .map(|(clause, _)| clause);
-    let param_env = ty::ParamEnv::new(tcx.mk_clauses_from_iter(hybrid_preds), Reveal::UserFacing);
+    let param_env = ty::ParamEnv::new(tcx.mk_clauses_from_iter(hybrid_preds));
     let param_env = normalize_param_env_or_error(tcx, param_env, ObligationCause::dummy());
 
     let ref infcx = tcx.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -170,11 +168,7 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
         tcx.dcx().delayed_bug("encountered errors when checking RPITIT refinement (selection)");
         return;
     }
-    let outlives_env = OutlivesEnvironment::with_bounds(
-        param_env,
-        infcx.implied_bounds_tys(param_env, impl_m.def_id.expect_local(), &implied_wf_types),
-    );
-    let errors = infcx.resolve_regions(&outlives_env);
+    let errors = infcx.resolve_regions(impl_m.def_id.expect_local(), param_env, implied_wf_types);
     if !errors.is_empty() {
         tcx.dcx().delayed_bug("encountered errors when checking RPITIT refinement (regions)");
         return;
@@ -289,19 +283,23 @@ fn report_mismatched_rpitit_signature<'tcx>(
         tcx.fn_sig(trait_m_def_id).skip_binder().bound_vars(),
         tcx.fn_sig(impl_m_def_id).skip_binder().bound_vars(),
     )
-    .filter_map(|(impl_bv, trait_bv)| {
+    .enumerate()
+    .filter_map(|(idx, (impl_bv, trait_bv))| {
         if let ty::BoundVariableKind::Region(impl_bv) = impl_bv
             && let ty::BoundVariableKind::Region(trait_bv) = trait_bv
         {
-            Some((impl_bv, trait_bv))
+            let var = ty::BoundVar::from_usize(idx);
+            Some((
+                ty::LateParamRegionKind::from_bound(var, impl_bv),
+                ty::LateParamRegionKind::from_bound(var, trait_bv),
+            ))
         } else {
             None
         }
     })
     .collect();
 
-    let mut return_ty =
-        trait_m_sig.output().fold_with(&mut super::RemapLateBound { tcx, mapping: &mapping });
+    let mut return_ty = trait_m_sig.output().fold_with(&mut super::RemapLateParam { tcx, mapping });
 
     if tcx.asyncness(impl_m_def_id).is_async() && tcx.asyncness(trait_m_def_id).is_async() {
         let ty::Alias(ty::Projection, future_ty) = return_ty.kind() else {
@@ -329,7 +327,7 @@ fn report_mismatched_rpitit_signature<'tcx>(
             hir::FnRetTy::Return(ty) => (ty.span, ty.span, "", ""),
         };
     let trait_return_span =
-        tcx.hir().get_if_local(trait_m_def_id).map(|node| match node.fn_decl().unwrap().output {
+        tcx.hir_get_if_local(trait_m_def_id).map(|node| match node.fn_decl().unwrap().output {
             hir::FnRetTy::DefaultReturn(_) => tcx.def_span(trait_m_def_id),
             hir::FnRetTy::Return(ty) => ty.span,
         });

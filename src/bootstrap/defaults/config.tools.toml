@@ -3,8 +3,13 @@
 [rust]
 # This greatly increases the speed of rebuilds, especially when there are only minor changes. However, it makes the initial build slightly slower.
 incremental = true
+# Most commonly, tools contributors do not need to modify the compiler, so
+# downloading a CI rustc is a good default for tools profile.
+download-rustc = "if-unchanged"
 
 [build]
+# cargo and clippy tests don't pass on stage 1
+test-stage = 2
 # Document with the in-tree rustdoc by default, since `download-rustc` makes it quick to compile.
 doc-stage = 2
 # Contributors working on tools will probably expect compiler docs to be generated, so they can figure out how to use the API.

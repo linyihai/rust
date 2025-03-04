@@ -4,7 +4,6 @@ use std::ops::Range;
 use std::str;
 
 use rustc_abi::{FIRST_VARIANT, ReprOptions, VariantIdx};
-use rustc_data_structures::captures::Captures;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::intern::Interned;
@@ -17,7 +16,8 @@ use rustc_index::{IndexSlice, IndexVec};
 use rustc_macros::{HashStable, TyDecodable, TyEncodable};
 use rustc_query_system::ich::StableHashingContext;
 use rustc_session::DataTypeKind;
-use rustc_span::symbol::sym;
+use rustc_span::sym;
+use rustc_type_ir::solve::AdtDestructorKind;
 use tracing::{debug, info, trace};
 
 use super::{
@@ -216,6 +216,10 @@ impl<'tcx> rustc_type_ir::inherent::AdtDef<TyCtxt<'tcx>> for AdtDef<'tcx> {
         self.is_phantom_data()
     }
 
+    fn is_manually_drop(self) -> bool {
+        self.is_manually_drop()
+    }
+
     fn all_field_tys(
         self,
         tcx: TyCtxt<'tcx>,
@@ -232,6 +236,13 @@ impl<'tcx> rustc_type_ir::inherent::AdtDef<TyCtxt<'tcx>> for AdtDef<'tcx> {
     fn is_fundamental(self) -> bool {
         self.is_fundamental()
     }
+
+    fn destructor(self, tcx: TyCtxt<'tcx>) -> Option<AdtDestructorKind> {
+        Some(match self.destructor(tcx)?.constness {
+            hir::Constness::Const => AdtDestructorKind::Const,
+            hir::Constness::NotConst => AdtDestructorKind::NotConst,
+        })
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, HashStable, TyEncodable, TyDecodable)]
@@ -241,9 +252,9 @@ pub enum AdtKind {
     Enum,
 }
 
-impl Into<DataTypeKind> for AdtKind {
-    fn into(self) -> DataTypeKind {
-        match self {
+impl From<AdtKind> for DataTypeKind {
+    fn from(val: AdtKind) -> Self {
+        match val {
             AdtKind::Struct => DataTypeKind::Struct,
             AdtKind::Union => DataTypeKind::Union,
             AdtKind::Enum => DataTypeKind::Enum,
@@ -402,10 +413,6 @@ impl<'tcx> AdtDef<'tcx> {
         self.destructor(tcx).is_some()
     }
 
-    pub fn has_non_const_dtor(self, tcx: TyCtxt<'tcx>) -> bool {
-        matches!(self.destructor(tcx), Some(Destructor { constness: hir::Constness::NotConst, .. }))
-    }
-
     /// Asserts this is a struct or union and returns its unique variant.
     pub fn non_enum_variant(self) -> &'tcx VariantDef {
         assert!(self.is_struct() || self.is_union());
@@ -532,7 +539,7 @@ impl<'tcx> AdtDef<'tcx> {
     pub fn discriminants(
         self,
         tcx: TyCtxt<'tcx>,
-    ) -> impl Iterator<Item = (VariantIdx, Discr<'tcx>)> + Captures<'tcx> {
+    ) -> impl Iterator<Item = (VariantIdx, Discr<'tcx>)> {
         assert!(self.is_enum());
         let repr_type = self.repr().discr_type();
         let initial = repr_type.initial_discriminant(tcx);

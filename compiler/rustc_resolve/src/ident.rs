@@ -9,8 +9,7 @@ use rustc_session::lint::builtin::PROC_MACRO_DERIVE_RESOLUTION_FALLBACK;
 use rustc_session::parse::feature_err;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::hygiene::{ExpnId, ExpnKind, LocalExpnId, MacroKind, SyntaxContext};
-use rustc_span::symbol::{Ident, kw};
-use rustc_span::{Span, sym};
+use rustc_span::{Ident, Span, kw, sym};
 use tracing::{debug, instrument};
 
 use crate::errors::{ParamKindInEnumDiscriminant, ParamKindInNonTrivialAnonConst};
@@ -247,23 +246,21 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         // ---- end
         // ```
         // So we have to fall back to the module's parent during lexical resolution in this case.
-        if derive_fallback_lint_id.is_some() {
-            if let Some(parent) = module.parent {
-                // Inner module is inside the macro, parent module is outside of the macro.
-                if module.expansion != parent.expansion
-                    && module.expansion.is_descendant_of(parent.expansion)
-                {
-                    // The macro is a proc macro derive
-                    if let Some(def_id) = module.expansion.expn_data().macro_def_id {
-                        let ext = &self.get_macro_by_def_id(def_id).ext;
-                        if ext.builtin_name.is_none()
-                            && ext.macro_kind() == MacroKind::Derive
-                            && parent.expansion.outer_expn_is_descendant_of(*ctxt)
-                        {
-                            return Some((parent, derive_fallback_lint_id));
-                        }
-                    }
-                }
+        if derive_fallback_lint_id.is_some()
+            && let Some(parent) = module.parent
+            // Inner module is inside the macro
+            && module.expansion != parent.expansion
+            // Parent module is outside of the macro
+            && module.expansion.is_descendant_of(parent.expansion)
+            // The macro is a proc macro derive
+            && let Some(def_id) = module.expansion.expn_data().macro_def_id
+        {
+            let ext = &self.get_macro_by_def_id(def_id).ext;
+            if ext.builtin_name.is_none()
+                && ext.macro_kind() == MacroKind::Derive
+                && parent.expansion.outer_expn_is_descendant_of(*ctxt)
+            {
+                return Some((parent, derive_fallback_lint_id));
             }
         }
 
@@ -594,8 +591,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     },
                     Scope::StdLibPrelude => {
                         let mut result = Err(Determinacy::Determined);
-                        if let Some(prelude) = this.prelude {
-                            if let Ok(binding) = this.resolve_ident_in_module_unadjusted(
+                        if let Some(prelude) = this.prelude
+                            && let Ok(binding) = this.resolve_ident_in_module_unadjusted(
                                 ModuleOrUniformRoot::Module(prelude),
                                 ident,
                                 ns,
@@ -604,14 +601,13 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                                 None,
                                 ignore_binding,
                                 ignore_import,
-                            ) {
-                                if matches!(use_prelude, UsePrelude::Yes)
-                                    || this.is_builtin_macro(binding.res())
-                                {
-                                    result = Ok((binding, Flags::MISC_FROM_PRELUDE));
-                                }
-                            }
+                            )
+                            && (matches!(use_prelude, UsePrelude::Yes)
+                                || this.is_builtin_macro(binding.res()))
+                        {
+                            result = Ok((binding, Flags::MISC_FROM_PRELUDE));
                         }
+
                         result
                     }
                     Scope::BuiltinTypes => match this.builtin_types_bindings.get(&ident.name) {
@@ -940,10 +936,10 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         };
 
         // Items and single imports are not shadowable, if we have one, then it's determined.
-        if let Some(binding) = binding {
-            if !binding.is_glob_import() {
-                return check_usable(self, binding);
-            }
+        if let Some(binding) = binding
+            && !binding.is_glob_import()
+        {
+            return check_usable(self, binding);
         }
 
         // --- From now on we either have a glob resolution or no resolution. ---
@@ -1135,6 +1131,17 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             return Res::Err;
         }
 
+        if let RibKind::ConstParamTy = all_ribs[rib_index].kind {
+            if let Some(span) = finalize {
+                self.report_error(
+                    span,
+                    ResolutionError::ParamInTyOfConstParam { name: rib_ident.name },
+                );
+            }
+            assert_eq!(res, Res::Err);
+            return Res::Err;
+        }
+
         match res {
             Res::Local(_) => {
                 use ResolutionError::*;
@@ -1185,21 +1192,25 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                                             }
                                             Some(_) => None,
                                         };
-                                        (rib_ident.span, AttemptToUseNonConstantValueInConstant {
-                                            ident: original_rib_ident_def,
-                                            suggestion: "const",
-                                            current: "let",
-                                            type_span,
-                                        })
+                                        (
+                                            rib_ident.span,
+                                            AttemptToUseNonConstantValueInConstant {
+                                                ident: original_rib_ident_def,
+                                                suggestion: "const",
+                                                current: "let",
+                                                type_span,
+                                            },
+                                        )
                                     }
-                                    Some((ident, kind)) => {
-                                        (span, AttemptToUseNonConstantValueInConstant {
+                                    Some((ident, kind)) => (
+                                        span,
+                                        AttemptToUseNonConstantValueInConstant {
                                             ident,
                                             suggestion: "let",
                                             current: kind.as_str(),
                                             type_span: None,
-                                        })
-                                    }
+                                        },
+                                    ),
                                 };
                                 self.report_error(span, resolution_error);
                             }
@@ -1207,10 +1218,10 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         }
                         RibKind::ConstParamTy => {
                             if let Some(span) = finalize {
-                                self.report_error(span, ParamInTyOfConstParam {
-                                    name: rib_ident.name,
-                                    param_kind: None,
-                                });
+                                self.report_error(
+                                    span,
+                                    ParamInTyOfConstParam { name: rib_ident.name },
+                                );
                             }
                             return Res::Err;
                         }
@@ -1236,6 +1247,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         | RibKind::MacroDefinition(..)
                         | RibKind::InlineAsmSym
                         | RibKind::AssocItem
+                        | RibKind::ConstParamTy
                         | RibKind::ForwardGenericParamBan => {
                             // Nothing to do. Continue.
                             continue;
@@ -1289,15 +1301,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         RibKind::Item(has_generic_params, def_kind) => {
                             (has_generic_params, def_kind)
                         }
-                        RibKind::ConstParamTy => {
-                            if let Some(span) = finalize {
-                                self.report_error(span, ResolutionError::ParamInTyOfConstParam {
-                                    name: rib_ident.name,
-                                    param_kind: Some(errors::ParamKindInTyOfConstParam::Type),
-                                });
-                            }
-                            return Res::Err;
-                        }
                     };
 
                     if let Some(span) = finalize {
@@ -1322,6 +1325,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         | RibKind::MacroDefinition(..)
                         | RibKind::InlineAsmSym
                         | RibKind::AssocItem
+                        | RibKind::ConstParamTy
                         | RibKind::ForwardGenericParamBan => continue,
 
                         RibKind::ConstantItem(trivial, _) => {
@@ -1354,15 +1358,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
                         RibKind::Item(has_generic_params, def_kind) => {
                             (has_generic_params, def_kind)
-                        }
-                        RibKind::ConstParamTy => {
-                            if let Some(span) = finalize {
-                                self.report_error(span, ResolutionError::ParamInTyOfConstParam {
-                                    name: rib_ident.name,
-                                    param_kind: Some(errors::ParamKindInTyOfConstParam::Const),
-                                });
-                            }
-                            return Res::Err;
                         }
                     };
 
@@ -1428,6 +1423,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         ignore_import: Option<Import<'ra>>,
     ) -> PathResult<'ra> {
         let mut module = None;
+        let mut module_had_parse_errors = false;
         let mut allow_super = true;
         let mut second_binding = None;
 
@@ -1437,13 +1433,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         for (segment_idx, &Segment { ident, id, .. }) in path.iter().enumerate() {
             debug!("resolve_path ident {} {:?} {:?}", segment_idx, ident, id);
             let record_segment_res = |this: &mut Self, res| {
-                if finalize.is_some() {
-                    if let Some(id) = id {
-                        if !this.partial_res_map.contains_key(&id) {
-                            assert!(id != ast::DUMMY_NODE_ID, "Trying to resolve dummy id");
-                            this.record_partial_res(id, PartialRes::new(res));
-                        }
-                    }
+                if finalize.is_some()
+                    && let Some(id) = id
+                    && !this.partial_res_map.contains_key(&id)
+                {
+                    assert!(id != ast::DUMMY_NODE_ID, "Trying to resolve dummy id");
+                    this.record_partial_res(id, PartialRes::new(res));
                 }
             };
 
@@ -1463,24 +1458,30 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                             _ => None,
                         },
                     };
-                    if let Some(self_module) = self_module {
-                        if let Some(parent) = self_module.parent {
-                            module = Some(ModuleOrUniformRoot::Module(
-                                self.resolve_self(&mut ctxt, parent),
-                            ));
-                            continue;
-                        }
+                    if let Some(self_module) = self_module
+                        && let Some(parent) = self_module.parent
+                    {
+                        module =
+                            Some(ModuleOrUniformRoot::Module(self.resolve_self(&mut ctxt, parent)));
+                        continue;
                     }
-                    return PathResult::failed(ident, false, finalize.is_some(), module, || {
-                        ("there are too many leading `super` keywords".to_string(), None)
-                    });
+                    return PathResult::failed(
+                        ident,
+                        false,
+                        finalize.is_some(),
+                        module_had_parse_errors,
+                        module,
+                        || ("there are too many leading `super` keywords".to_string(), None),
+                    );
                 }
                 if segment_idx == 0 {
                     if name == kw::SelfLower {
                         let mut ctxt = ident.span.ctxt().normalize_to_macros_2_0();
-                        module = Some(ModuleOrUniformRoot::Module(
-                            self.resolve_self(&mut ctxt, parent_scope.module),
-                        ));
+                        let self_mod = self.resolve_self(&mut ctxt, parent_scope.module);
+                        if let Some(res) = self_mod.res() {
+                            record_segment_res(self, res);
+                        }
+                        module = Some(ModuleOrUniformRoot::Module(self_mod));
                         continue;
                     }
                     if name == kw::PathRoot && ident.span.at_least_rust_2018() {
@@ -1497,7 +1498,11 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     }
                     if name == kw::PathRoot || name == kw::Crate || name == kw::DollarCrate {
                         // `::a::b`, `crate::a::b` or `$crate::a::b`
-                        module = Some(ModuleOrUniformRoot::Module(self.resolve_crate_root(ident)));
+                        let crate_root = self.resolve_crate_root(ident);
+                        if let Some(res) = crate_root.res() {
+                            record_segment_res(self, res);
+                        }
+                        module = Some(ModuleOrUniformRoot::Module(crate_root));
                         continue;
                     }
                 }
@@ -1505,19 +1510,26 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
             // Report special messages for path segment keywords in wrong positions.
             if ident.is_path_segment_keyword() && segment_idx != 0 {
-                return PathResult::failed(ident, false, finalize.is_some(), module, || {
-                    let name_str = if name == kw::PathRoot {
-                        "crate root".to_string()
-                    } else {
-                        format!("`{name}`")
-                    };
-                    let label = if segment_idx == 1 && path[0].ident.name == kw::PathRoot {
-                        format!("global paths cannot start with {name_str}")
-                    } else {
-                        format!("{name_str} in paths can only be used in start position")
-                    };
-                    (label, None)
-                });
+                return PathResult::failed(
+                    ident,
+                    false,
+                    finalize.is_some(),
+                    module_had_parse_errors,
+                    module,
+                    || {
+                        let name_str = if name == kw::PathRoot {
+                            "crate root".to_string()
+                        } else {
+                            format!("`{name}`")
+                        };
+                        let label = if segment_idx == 1 && path[0].ident.name == kw::PathRoot {
+                            format!("global paths cannot start with {name_str}")
+                        } else {
+                            format!("{name_str} in paths can only be used in start position")
+                        };
+                        (label, None)
+                    },
+                );
             }
 
             let binding = if let Some(module) = module {
@@ -1583,6 +1595,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
                     let maybe_assoc = opt_ns != Some(MacroNS) && PathSource::Type.is_expected(res);
                     if let Some(next_module) = binding.module() {
+                        if self.mods_with_parse_errors.contains(&next_module.def_id()) {
+                            module_had_parse_errors = true;
+                        }
                         module = Some(ModuleOrUniformRoot::Module(next_module));
                         record_segment_res(self, res);
                     } else if res == Res::ToolMod && !is_last && opt_ns.is_some() {
@@ -1608,6 +1623,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                             ident,
                             is_last,
                             finalize.is_some(),
+                            module_had_parse_errors,
                             module,
                             || {
                                 let label = format!(
@@ -1622,28 +1638,36 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 }
                 Err(Undetermined) => return PathResult::Indeterminate,
                 Err(Determined) => {
-                    if let Some(ModuleOrUniformRoot::Module(module)) = module {
-                        if opt_ns.is_some() && !module.is_normal() {
-                            return PathResult::NonModule(PartialRes::with_unresolved_segments(
-                                module.res().unwrap(),
-                                path.len() - segment_idx,
-                            ));
-                        }
+                    if let Some(ModuleOrUniformRoot::Module(module)) = module
+                        && opt_ns.is_some()
+                        && !module.is_normal()
+                    {
+                        return PathResult::NonModule(PartialRes::with_unresolved_segments(
+                            module.res().unwrap(),
+                            path.len() - segment_idx,
+                        ));
                     }
 
-                    return PathResult::failed(ident, is_last, finalize.is_some(), module, || {
-                        self.report_path_resolution_error(
-                            path,
-                            opt_ns,
-                            parent_scope,
-                            ribs,
-                            ignore_binding,
-                            ignore_import,
-                            module,
-                            segment_idx,
-                            ident,
-                        )
-                    });
+                    return PathResult::failed(
+                        ident,
+                        is_last,
+                        finalize.is_some(),
+                        module_had_parse_errors,
+                        module,
+                        || {
+                            self.report_path_resolution_error(
+                                path,
+                                opt_ns,
+                                parent_scope,
+                                ribs,
+                                ignore_binding,
+                                ignore_import,
+                                module,
+                                segment_idx,
+                                ident,
+                            )
+                        },
+                    );
                 }
             }
         }

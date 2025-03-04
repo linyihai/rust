@@ -71,6 +71,10 @@ impl<'tcx> crate::MirPass<'tcx> for DataflowConstProp {
         let mut patch = visitor.patch;
         debug_span!("patch").in_scope(|| patch.visit_body_preserves_cfg(body));
     }
+
+    fn is_required(&self) -> bool {
+        false
+    }
 }
 
 // Note: Currently, places that have their reference taken cannot be tracked. Although this would
@@ -106,7 +110,7 @@ impl<'tcx> Analysis<'tcx> for ConstAnalysis<'_, 'tcx> {
         }
     }
 
-    fn apply_statement_effect(
+    fn apply_primary_statement_effect(
         &mut self,
         state: &mut Self::Domain,
         statement: &Statement<'tcx>,
@@ -117,7 +121,7 @@ impl<'tcx> Analysis<'tcx> for ConstAnalysis<'_, 'tcx> {
         }
     }
 
-    fn apply_terminator_effect<'mir>(
+    fn apply_primary_terminator_effect<'mir>(
         &mut self,
         state: &mut Self::Domain,
         terminator: &'mir Terminator<'tcx>,
@@ -186,7 +190,8 @@ impl<'a, 'tcx> ConstAnalysis<'a, 'tcx> {
             | StatementKind::FakeRead(..)
             | StatementKind::PlaceMention(..)
             | StatementKind::Coverage(..)
-            | StatementKind::AscribeUserType(..) => (),
+            | StatementKind::BackwardIncompatibleDropHint { .. }
+            | StatementKind::AscribeUserType(..) => {}
         }
     }
 
@@ -223,7 +228,7 @@ impl<'a, 'tcx> ConstAnalysis<'a, 'tcx> {
     }
 
     /// The effect of a successful function call return should not be
-    /// applied here, see [`Analysis::apply_terminator_effect`].
+    /// applied here, see [`Analysis::apply_primary_terminator_effect`].
     fn handle_terminator<'mir>(
         &self,
         terminator: &'mir Terminator<'tcx>,
@@ -499,7 +504,8 @@ impl<'a, 'tcx> ConstAnalysis<'a, 'tcx> {
             | Rvalue::Cast(..)
             | Rvalue::BinaryOp(..)
             | Rvalue::Aggregate(..)
-            | Rvalue::ShallowInitBox(..) => {
+            | Rvalue::ShallowInitBox(..)
+            | Rvalue::WrapUnsafeBinder(..) => {
                 // No modification is possible through these r-values.
                 return ValueOrPlace::TOP;
             }
@@ -533,8 +539,13 @@ impl<'a, 'tcx> ConstAnalysis<'a, 'tcx> {
             // This allows the set of visited edges to grow monotonically with the lattice.
             FlatSet::Bottom => TerminatorEdges::None,
             FlatSet::Elem(scalar) => {
-                let choice = scalar.assert_scalar_int().to_bits_unchecked();
-                TerminatorEdges::Single(targets.target_for_value(choice))
+                if let Ok(scalar_int) = scalar.try_to_scalar_int() {
+                    TerminatorEdges::Single(
+                        targets.target_for_value(scalar_int.to_bits_unchecked()),
+                    )
+                } else {
+                    TerminatorEdges::SwitchInt { discr, targets }
+                }
             }
             FlatSet::Top => TerminatorEdges::SwitchInt { discr, targets },
         }
@@ -938,7 +949,8 @@ fn try_write_constant<'tcx>(
         | ty::Closure(..)
         | ty::CoroutineClosure(..)
         | ty::Coroutine(..)
-        | ty::Dynamic(..) => throw_machine_stop_str!("unsupported type"),
+        | ty::Dynamic(..)
+        | ty::UnsafeBinder(_) => throw_machine_stop_str!("unsupported type"),
 
         ty::Error(_) | ty::Infer(..) | ty::CoroutineWitness(..) => bug!(),
     }
@@ -948,7 +960,7 @@ fn try_write_constant<'tcx>(
 
 impl<'mir, 'tcx> ResultsVisitor<'mir, 'tcx, ConstAnalysis<'_, 'tcx>> for Collector<'_, 'tcx> {
     #[instrument(level = "trace", skip(self, results, statement))]
-    fn visit_statement_before_primary_effect(
+    fn visit_after_early_statement_effect(
         &mut self,
         results: &mut Results<'tcx, ConstAnalysis<'_, 'tcx>>,
         state: &State<FlatSet<Scalar>>,
@@ -970,7 +982,7 @@ impl<'mir, 'tcx> ResultsVisitor<'mir, 'tcx, ConstAnalysis<'_, 'tcx>> for Collect
     }
 
     #[instrument(level = "trace", skip(self, results, statement))]
-    fn visit_statement_after_primary_effect(
+    fn visit_after_primary_statement_effect(
         &mut self,
         results: &mut Results<'tcx, ConstAnalysis<'_, 'tcx>>,
         state: &State<FlatSet<Scalar>>,
@@ -995,7 +1007,7 @@ impl<'mir, 'tcx> ResultsVisitor<'mir, 'tcx, ConstAnalysis<'_, 'tcx>> for Collect
         }
     }
 
-    fn visit_terminator_before_primary_effect(
+    fn visit_after_early_terminator_effect(
         &mut self,
         results: &mut Results<'tcx, ConstAnalysis<'_, 'tcx>>,
         state: &State<FlatSet<Scalar>>,

@@ -13,7 +13,7 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::HirId;
 use rustc_hir::def::DefKind;
 use rustc_index::IndexVec;
-use rustc_index::bit_set::BitSet;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::bug;
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
@@ -67,7 +67,7 @@ struct ConstPropagator<'mir, 'tcx> {
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
     worklist: Vec<BasicBlock>,
-    visited_blocks: BitSet<BasicBlock>,
+    visited_blocks: DenseBitSet<BasicBlock>,
     locals: IndexVec<Local, Value<'tcx>>,
     body: &'mir Body<'tcx>,
     written_only_inside_own_block_locals: FxHashSet<Local>,
@@ -190,7 +190,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             tcx,
             typing_env,
             worklist: vec![START_BLOCK],
-            visited_blocks: BitSet::new_empty(body.basic_blocks.len()),
+            visited_blocks: DenseBitSet::new_empty(body.basic_blocks.len()),
             locals: IndexVec::from_elem_n(Value::Uninit, body.local_decls.len()),
             body,
             can_const_prop,
@@ -258,7 +258,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         // Normalization needed b/c known panics lint runs in
         // `mir_drops_elaborated_and_const_checked`, which happens before
         // optimized MIR. Only after optimizing the MIR can we guarantee
-        // that the `RevealAll` pass has happened and that the body's consts
+        // that the `PostAnalysisNormalize` pass has happened and that the body's consts
         // are normalized, so any call to resolve before that needs to be
         // manually normalized.
         let val = self.tcx.try_normalize_erasing_regions(self.typing_env, c.const_).ok()?;
@@ -296,11 +296,12 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         let source_info = self.body.source_info(location);
         if let Some(lint_root) = self.lint_root(*source_info) {
             let span = source_info.span;
-            self.tcx.emit_node_span_lint(lint_kind.lint(), lint_root, span, AssertLint {
+            self.tcx.emit_node_span_lint(
+                lint_kind.lint(),
+                lint_root,
                 span,
-                assert_kind,
-                lint_kind,
-            });
+                AssertLint { span, assert_kind, lint_kind },
+            );
         }
     }
 
@@ -444,7 +445,8 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             | Rvalue::Cast(..)
             | Rvalue::ShallowInitBox(..)
             | Rvalue::Discriminant(..)
-            | Rvalue::NullaryOp(..) => {}
+            | Rvalue::NullaryOp(..)
+            | Rvalue::WrapUnsafeBinder(..) => {}
         }
 
         // FIXME we need to revisit this for #67176
@@ -507,7 +509,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                     // other overflow checks.
                     AssertKind::Overflow(*bin_op, eval_to_int(op1), eval_to_int(op2))
                 }
-                AssertKind::BoundsCheck { ref len, ref index } => {
+                AssertKind::BoundsCheck { len, index } => {
                     let len = eval_to_int(len);
                     let index = eval_to_int(index);
                     AssertKind::BoundsCheck { len, index }
@@ -546,7 +548,9 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         let val: Value<'_> = match *rvalue {
             ThreadLocalRef(_) => return None,
 
-            Use(ref operand) => self.eval_operand(operand)?.into(),
+            Use(ref operand) | WrapUnsafeBinder(ref operand, _) => {
+                self.eval_operand(operand)?.into()
+            }
 
             CopyForDeref(place) => self.eval_place(place)?.into(),
 
@@ -626,6 +630,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                         .offset_of_subfield(self.typing_env, op_layout, fields.iter())
                         .bytes(),
                     NullOp::UbChecks => return None,
+                    NullOp::ContractChecks => return None,
                 };
                 ImmTy::from_scalar(Scalar::from_target_usize(val, self), layout).into()
             }
@@ -777,10 +782,10 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
     fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
         self.super_terminator(terminator, location);
         match &terminator.kind {
-            TerminatorKind::Assert { expected, ref msg, ref cond, .. } => {
+            TerminatorKind::Assert { expected, msg, cond, .. } => {
                 self.check_assertion(*expected, msg, cond, location);
             }
-            TerminatorKind::SwitchInt { ref discr, ref targets } => {
+            TerminatorKind::SwitchInt { discr, targets } => {
                 if let Some(ref value) = self.eval_operand(discr)
                     && let Some(value_const) = self.use_ecx(|this| this.ecx.read_scalar(value))
                     && let Some(constant) = value_const.to_bits(value_const.size()).discard_err()
@@ -867,7 +872,7 @@ enum ConstPropMode {
 struct CanConstProp {
     can_const_prop: IndexVec<Local, ConstPropMode>,
     // False at the beginning. Once set, no more assignments are allowed to that local.
-    found_assignment: BitSet<Local>,
+    found_assignment: DenseBitSet<Local>,
 }
 
 impl CanConstProp {
@@ -879,7 +884,7 @@ impl CanConstProp {
     ) -> IndexVec<Local, ConstPropMode> {
         let mut cpv = CanConstProp {
             can_const_prop: IndexVec::from_elem(ConstPropMode::FullConstProp, &body.local_decls),
-            found_assignment: BitSet::new_empty(body.local_decls.len()),
+            found_assignment: DenseBitSet::new_empty(body.local_decls.len()),
         };
         for (local, val) in cpv.can_const_prop.iter_enumerated_mut() {
             let ty = body.local_decls[local].ty;

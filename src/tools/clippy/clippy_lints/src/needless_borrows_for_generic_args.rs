@@ -1,7 +1,7 @@
 use clippy_config::Conf;
-use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::mir::{PossibleBorrowerMap, enclosing_mir, expr_local, local_assignments, used_exactly_once};
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet_with_context;
 use clippy_utils::ty::{implements_trait, is_copy};
 use clippy_utils::{DefinedTy, ExprUseNode, expr_use_ctxt, peel_n_hir_expr_refs};
@@ -9,7 +9,7 @@ use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::{Body, Expr, ExprKind, Mutability, Path, QPath};
-use rustc_index::bit_set::BitSet;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::mir::{Rvalue, StatementKind};
@@ -72,7 +72,7 @@ impl NeedlessBorrowsForGenericArgs<'_> {
     pub fn new(conf: &'static Conf) -> Self {
         Self {
             possible_borrowers: Vec::new(),
-            msrv: conf.msrv.clone(),
+            msrv: conf.msrv,
         }
     }
 }
@@ -114,7 +114,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessBorrowsForGenericArgs<'tcx> {
                 i,
                 param_ty,
                 expr,
-                &self.msrv,
+                self.msrv,
             )
             && count != 0
         {
@@ -137,13 +137,11 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessBorrowsForGenericArgs<'tcx> {
         if self
             .possible_borrowers
             .last()
-            .is_some_and(|&(local_def_id, _)| local_def_id == cx.tcx.hir().body_owner_def_id(body.id()))
+            .is_some_and(|&(local_def_id, _)| local_def_id == cx.tcx.hir_body_owner_def_id(body.id()))
         {
             self.possible_borrowers.pop();
         }
     }
-
-    extract_msrv_attr!(LateContext);
 }
 
 fn path_has_args(p: &QPath<'_>) -> bool {
@@ -172,7 +170,7 @@ fn needless_borrow_count<'tcx>(
     arg_index: usize,
     param_ty: ParamTy,
     mut expr: &Expr<'tcx>,
-    msrv: &Msrv,
+    msrv: Msrv,
 ) -> usize {
     let destruct_trait_def_id = cx.tcx.lang_items().destruct_trait();
     let sized_trait_def_id = cx.tcx.lang_items().sized_trait();
@@ -273,7 +271,7 @@ fn needless_borrow_count<'tcx>(
                 && let ty::Param(param_ty) = trait_predicate.self_ty().kind()
                 && let GenericArgKind::Type(ty) = args_with_referent_ty[param_ty.index as usize].unpack()
                 && ty.is_array()
-                && !msrv.meets(msrvs::ARRAY_INTO_ITERATOR)
+                && !msrv.meets(cx, msrvs::ARRAY_INTO_ITERATOR)
             {
                 return false;
             }
@@ -359,10 +357,10 @@ fn referent_used_exactly_once<'tcx>(
         && let StatementKind::Assign(box (_, Rvalue::Ref(_, _, place))) = statement.kind
         && !place.is_indirect_first_projection()
     {
-        let body_owner_local_def_id = cx.tcx.hir().enclosing_body_owner(reference.hir_id);
+        let body_owner_local_def_id = cx.tcx.hir_enclosing_body_owner(reference.hir_id);
         if possible_borrowers
             .last()
-            .map_or(true, |&(local_def_id, _)| local_def_id != body_owner_local_def_id)
+            .is_none_or(|&(local_def_id, _)| local_def_id != body_owner_local_def_id)
         {
             possible_borrowers.push((body_owner_local_def_id, PossibleBorrowerMap::new(cx, mir)));
         }
@@ -390,7 +388,7 @@ fn replace_types<'tcx>(
     projection_predicates: &[ProjectionPredicate<'tcx>],
     args: &mut [GenericArg<'tcx>],
 ) -> bool {
-    let mut replaced = BitSet::new_empty(args.len());
+    let mut replaced = DenseBitSet::new_empty(args.len());
 
     let mut deque = VecDeque::with_capacity(args.len());
     deque.push_back((param_ty, new_ty));

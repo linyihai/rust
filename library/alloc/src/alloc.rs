@@ -10,10 +10,7 @@ use core::hint;
 #[cfg(not(test))]
 use core::ptr::{self, NonNull};
 
-#[cfg(test)]
-mod tests;
-
-extern "Rust" {
+unsafe extern "Rust" {
     // These are the magic symbols to call the global allocator. rustc generates
     // them to call `__rg_alloc` etc. if there is a `#[global_allocator]` attribute
     // (the code expanding that attribute macro generates those functions), or to call
@@ -61,7 +58,7 @@ pub use std::alloc::Global;
 /// of the allocator registered with the `#[global_allocator]` attribute
 /// if there is one, or the `std` crate’s default.
 ///
-/// This function is expected to be deprecated in favor of the `alloc` method
+/// This function is expected to be deprecated in favor of the `allocate` method
 /// of the [`Global`] type when it and the [`Allocator`] trait become stable.
 ///
 /// # Safety
@@ -106,7 +103,7 @@ pub unsafe fn alloc(layout: Layout) -> *mut u8 {
 /// of the allocator registered with the `#[global_allocator]` attribute
 /// if there is one, or the `std` crate’s default.
 ///
-/// This function is expected to be deprecated in favor of the `dealloc` method
+/// This function is expected to be deprecated in favor of the `deallocate` method
 /// of the [`Global`] type when it and the [`Allocator`] trait become stable.
 ///
 /// # Safety
@@ -125,7 +122,7 @@ pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
 /// of the allocator registered with the `#[global_allocator]` attribute
 /// if there is one, or the `std` crate’s default.
 ///
-/// This function is expected to be deprecated in favor of the `realloc` method
+/// This function is expected to be deprecated in favor of the `grow` and `shrink` methods
 /// of the [`Global`] type when it and the [`Allocator`] trait become stable.
 ///
 /// # Safety
@@ -145,7 +142,7 @@ pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 
 /// of the allocator registered with the `#[global_allocator]` attribute
 /// if there is one, or the `std` crate’s default.
 ///
-/// This function is expected to be deprecated in favor of the `alloc_zeroed` method
+/// This function is expected to be deprecated in favor of the `allocate_zeroed` method
 /// of the [`Global`] type when it and the [`Allocator`] trait become stable.
 ///
 /// # Safety
@@ -267,8 +264,14 @@ unsafe impl Allocator for Global {
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         if layout.size() != 0 {
-            // SAFETY: `layout` is non-zero in size,
-            // other conditions must be upheld by the caller
+            // SAFETY:
+            // * We have checked that `layout` is non-zero in size.
+            // * The caller is obligated to provide a layout that "fits", and in this case,
+            //   "fit" always means a layout that is equal to the original, because our
+            //   `allocate()`, `grow()`, and `shrink()` implementations never returns a larger
+            //   allocation than requested.
+            // * Other conditions must be upheld by the caller, as per `Allocator::deallocate()`'s
+            //   safety documentation.
             unsafe { dealloc(ptr.as_ptr(), layout) }
         }
     }
@@ -342,7 +345,7 @@ unsafe impl Allocator for Global {
     }
 }
 
-/// The allocator for unique pointers.
+/// The allocator for `Box`.
 #[cfg(all(not(no_global_oom_handling), not(test)))]
 #[lang = "exchange_malloc"]
 #[inline]
@@ -358,7 +361,7 @@ unsafe fn exchange_malloc(size: usize, align: usize) -> *mut u8 {
 // # Allocation error handler
 
 #[cfg(not(no_global_oom_handling))]
-extern "Rust" {
+unsafe extern "Rust" {
     // This is the magic symbol to call the global alloc error handler. rustc generates
     // it to call `__rg_oom` if there is a `#[alloc_error_handler]`, or to call the
     // default implementations below (`__rdl_oom`) otherwise.
@@ -429,7 +432,7 @@ pub mod __alloc_error_handler {
     // `#[alloc_error_handler]`.
     #[rustc_std_internal_symbol]
     pub unsafe fn __rdl_oom(size: usize, _align: usize) -> ! {
-        extern "Rust" {
+        unsafe extern "Rust" {
             // This symbol is emitted by rustc next to __rust_alloc_error_handler.
             // Its value depends on the -Zoom={panic,abort} compiler option.
             static __rust_alloc_error_handler_should_panic: u8;

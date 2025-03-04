@@ -125,9 +125,6 @@ resolve_const_param_in_enum_discriminant =
 resolve_const_param_in_non_trivial_anon_const =
     const parameters may only be used as standalone arguments, i.e. `{$name}`
 
-resolve_const_param_in_ty_of_const_param =
-    const parameters may not be used in the type of const parameters
-
 resolve_constructor_private_if_any_field_private =
     a constructor is private if any of the fields is private
 
@@ -250,15 +247,18 @@ resolve_lifetime_param_in_enum_discriminant =
 resolve_lifetime_param_in_non_trivial_anon_const =
     lifetime parameters may not be used in const expressions
 
-resolve_lifetime_param_in_ty_of_const_param =
-    lifetime parameters may not be used in the type of const parameters
-
 resolve_lowercase_self =
     attempt to use a non-constant value in a constant
     .suggestion = try using `Self`
 
+resolve_macro_cannot_use_as_attr =
+    `{$ident}` exists, but a declarative macro cannot be used as an attribute macro
+
+resolve_macro_cannot_use_as_derive =
+     `{$ident}` exists, but a declarative macro cannot be used as a derive macro
+
 resolve_macro_defined_later =
-    a macro with the same name exists, but it appears later at here
+    a macro with the same name exists, but it appears later
 
 resolve_macro_expanded_extern_crate_cannot_shadow_extern_arguments =
     macro-expanded `extern crate` items cannot shadow names passed with `--extern`
@@ -430,9 +430,6 @@ resolve_type_param_in_enum_discriminant =
 
 resolve_type_param_in_non_trivial_anon_const =
     type parameters may not be used in const expressions
-
-resolve_type_param_in_ty_of_const_param =
-    type parameters may not be used in the type of const parameters
 
 resolve_undeclared_label =
     use of undeclared label `{$name}`
