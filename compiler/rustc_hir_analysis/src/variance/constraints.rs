@@ -252,13 +252,9 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
 
             ty::Pat(typ, pat) => {
                 match *pat {
-                    ty::PatternKind::Range { start, end, include_end: _ } => {
-                        if let Some(start) = start {
-                            self.add_constraints_from_const(current, start, variance);
-                        }
-                        if let Some(end) = end {
-                            self.add_constraints_from_const(current, end, variance);
-                        }
+                    ty::PatternKind::Range { start, end } => {
+                        self.add_constraints_from_const(current, start, variance);
+                        self.add_constraints_from_const(current, end, variance);
                     }
                 }
                 self.add_constraints_from_ty(current, typ, variance);
@@ -320,6 +316,11 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
 
             ty::FnPtr(sig_tys, hdr) => {
                 self.add_constraints_from_sig(current, sig_tys.with(hdr), variance);
+            }
+
+            ty::UnsafeBinder(ty) => {
+                // FIXME(unsafe_binders): This is covariant, right?
+                self.add_constraints_from_ty(current, ty.skip_binder(), variance);
             }
 
             ty::Error(_) => {

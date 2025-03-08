@@ -1,9 +1,14 @@
 //! Implementation of applying changes to a syntax tree.
 
-use std::{cmp::Ordering, collections::VecDeque, ops::RangeInclusive};
+use std::{
+    cmp::Ordering,
+    collections::VecDeque,
+    ops::{Range, RangeInclusive},
+};
 
 use rowan::TextRange;
 use rustc_hash::FxHashMap;
+use stdx::format_to;
 
 use crate::{
     syntax_editor::{mapping::MissingMapping, Change, ChangeKind, PositionRepr},
@@ -73,14 +78,12 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
         })
         .all(|(l, r)| {
             get_node_depth(l.target_parent()) != get_node_depth(r.target_parent())
-                || l.target_range().intersect(r.target_range()).is_none()
+                || (l.target_range().end() <= r.target_range().start())
         });
 
-    if stdx::never!(
-        !disjoint_replaces_ranges,
-        "some replace change ranges intersect: {:?}",
-        changes
-    ) {
+    if !disjoint_replaces_ranges {
+        report_intersecting_changes(&changes, get_node_depth, &root);
+
         return SyntaxEdit {
             old_root: root.clone(),
             new_root: root,
@@ -99,6 +102,7 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
     let mut changed_ancestors: VecDeque<ChangedAncestor> = VecDeque::new();
     let mut dependent_changes = vec![];
     let mut independent_changes = vec![];
+    let mut outdated_changes = vec![];
 
     for (change_index, change) in changes.iter().enumerate() {
         // Check if this change is dependent on another change (i.e. it's contained within another range)
@@ -113,10 +117,14 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
             // FIXME: Resolve changes that depend on a range of elements
             let ancestor = &changed_ancestors[index];
 
-            dependent_changes.push(DependentChange {
-                parent: ancestor.change_index as u32,
-                child: change_index as u32,
-            });
+            if let Change::Replace(_, None) = changes[ancestor.change_index] {
+                outdated_changes.push(change_index as u32);
+            } else {
+                dependent_changes.push(DependentChange {
+                    parent: ancestor.change_index as u32,
+                    child: change_index as u32,
+                });
+            }
         } else {
             // This change is independent of any other change
 
@@ -128,13 +136,14 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
 
         // Add to changed ancestors, if applicable
         match change {
-            Change::Insert(_, _) | Change::InsertAll(_, _) => {}
-            Change::Replace(target, _) | Change::ReplaceWithMany(target, _) => {
+            Change::Replace(SyntaxElement::Node(target), _)
+            | Change::ReplaceWithMany(SyntaxElement::Node(target), _) => {
                 changed_ancestors.push_back(ChangedAncestor::single(target, change_index))
             }
             Change::ReplaceAll(range, _) => {
                 changed_ancestors.push_back(ChangedAncestor::multiple(range, change_index))
             }
+            _ => (),
         }
     }
 
@@ -153,6 +162,12 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
                         *child = tree_mutator.make_element_mut(child);
                     }
                 };
+            }
+            Change::Replace(SyntaxElement::Node(target), Some(SyntaxElement::Node(new_target))) => {
+                *target = tree_mutator.make_syntax_mut(target);
+                if new_target.ancestors().any(|node| node == tree_mutator.immutable) {
+                    *new_target = new_target.clone_for_update();
+                }
             }
             Change::Replace(target, _) | Change::ReplaceWithMany(target, _) => {
                 *target = tree_mutator.make_element_mut(target);
@@ -185,8 +200,9 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
             Change::Replace(target, Some(new_target)) => {
                 (to_owning_node(target), to_owning_node(new_target))
             }
-            // Silently drop outdated change
-            Change::Replace(_, None) => continue,
+            Change::Replace(_, None) => {
+                unreachable!("deletions should not generate dependent changes")
+            }
             Change::ReplaceAll(_, _) | Change::ReplaceWithMany(_, _) => {
                 unimplemented!("cannot resolve changes that depend on replacing many elements")
             }
@@ -222,6 +238,12 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
                 *range = upmap_target(range.start())..=upmap_target(range.end());
             }
         }
+    }
+
+    // We reverse here since we pushed to this in ascending order,
+    // and we want to remove elements in descending order
+    for idx in outdated_changes.into_iter().rev() {
+        changes.remove(idx as usize);
     }
 
     // Apply changes
@@ -286,6 +308,78 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
     }
 }
 
+fn report_intersecting_changes(
+    changes: &[Change],
+    mut get_node_depth: impl FnMut(rowan::SyntaxNode<crate::RustLanguage>) -> usize,
+    root: &rowan::SyntaxNode<crate::RustLanguage>,
+) {
+    let intersecting_changes = changes
+        .iter()
+        .zip(changes.iter().skip(1))
+        .filter(|(l, r)| {
+            // We only care about checking for disjoint replace ranges.
+            matches!(
+                (l.change_kind(), r.change_kind()),
+                (
+                    ChangeKind::Replace | ChangeKind::ReplaceRange,
+                    ChangeKind::Replace | ChangeKind::ReplaceRange
+                )
+            )
+        })
+        .filter(|(l, r)| {
+            get_node_depth(l.target_parent()) == get_node_depth(r.target_parent())
+                && (l.target_range().end() > r.target_range().start())
+        });
+
+    let mut error_msg = String::from("some replace change ranges intersect!\n");
+
+    let parent_str = root.to_string();
+
+    for (l, r) in intersecting_changes {
+        let mut highlighted_str = parent_str.clone();
+        let l_range = l.target_range();
+        let r_range = r.target_range();
+
+        let i_range = l_range.intersect(r_range).unwrap();
+        let i_str = format!("\x1b[46m{}", &parent_str[i_range]);
+
+        let pre_range: Range<usize> = l_range.start().into()..i_range.start().into();
+        let pre_str = format!("\x1b[44m{}", &parent_str[pre_range]);
+
+        let (highlight_range, highlight_str) = if l_range == r_range {
+            format_to!(error_msg, "\x1b[46mleft change:\x1b[0m  {l:?} {l}\n");
+            format_to!(error_msg, "\x1b[46mequals\x1b[0m\n");
+            format_to!(error_msg, "\x1b[46mright change:\x1b[0m {r:?} {r}\n");
+            let i_highlighted = format!("{i_str}\x1b[0m\x1b[K");
+            let total_range: Range<usize> = i_range.into();
+            (total_range, i_highlighted)
+        } else {
+            format_to!(error_msg, "\x1b[44mleft change:\x1b[0m  {l:?} {l}\n");
+            let range_end = if l_range.contains_range(r_range) {
+                format_to!(error_msg, "\x1b[46mcovers\x1b[0m\n");
+                format_to!(error_msg, "\x1b[46mright change:\x1b[0m {r:?} {r}\n");
+                l_range.end()
+            } else {
+                format_to!(error_msg, "\x1b[46mintersects\x1b[0m\n");
+                format_to!(error_msg, "\x1b[42mright change:\x1b[0m {r:?} {r}\n");
+                r_range.end()
+            };
+
+            let post_range: Range<usize> = i_range.end().into()..range_end.into();
+
+            let post_str = format!("\x1b[42m{}", &parent_str[post_range]);
+            let result = format!("{pre_str}{i_str}{post_str}\x1b[0m\x1b[K");
+            let total_range: Range<usize> = l_range.start().into()..range_end.into();
+            (total_range, result)
+        };
+        highlighted_str.replace_range(highlight_range, &highlight_str);
+
+        format_to!(error_msg, "{highlighted_str}\n");
+    }
+
+    stdx::always!(false, "{}", error_msg);
+}
+
 fn to_owning_node(element: &SyntaxElement) -> SyntaxNode {
     match element {
         SyntaxElement::Node(node) => node.clone(),
@@ -304,13 +398,8 @@ enum ChangedAncestorKind {
 }
 
 impl ChangedAncestor {
-    fn single(element: &SyntaxElement, change_index: usize) -> Self {
-        let kind = match element {
-            SyntaxElement::Node(node) => ChangedAncestorKind::Single { node: node.clone() },
-            SyntaxElement::Token(token) => {
-                ChangedAncestorKind::Single { node: token.parent().unwrap() }
-            }
-        };
+    fn single(node: &SyntaxNode, change_index: usize) -> Self {
+        let kind = ChangedAncestorKind::Single { node: node.clone() };
 
         Self { kind, change_index }
     }

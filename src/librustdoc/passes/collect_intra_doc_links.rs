@@ -53,12 +53,12 @@ pub(crate) fn collect_intra_doc_links<'a, 'tcx>(
     (krate, collector)
 }
 
-fn filter_assoc_items_by_name_and_namespace<'a>(
-    tcx: TyCtxt<'a>,
+fn filter_assoc_items_by_name_and_namespace(
+    tcx: TyCtxt<'_>,
     assoc_items_of: DefId,
     ident: Ident,
     ns: Namespace,
-) -> impl Iterator<Item = &'a ty::AssocItem> + 'a {
+) -> impl Iterator<Item = &ty::AssocItem> {
     tcx.associated_items(assoc_items_of).filter_by_name_unhygienic(ident.name).filter(move |item| {
         item.kind.namespace() == ns && tcx.hygienic_eq(ident, item.ident(tcx), assoc_items_of)
     })
@@ -232,7 +232,7 @@ impl UrlFragment {
                 s.push_str(kind);
                 s.push_str(tcx.item_name(def_id).as_str());
             }
-            UrlFragment::UserWritten(raw) => s.push_str(&raw),
+            UrlFragment::UserWritten(raw) => s.push_str(raw),
         }
     }
 }
@@ -307,7 +307,7 @@ pub(crate) struct AmbiguousLinks {
     resolved: Vec<(Res, Option<UrlFragment>)>,
 }
 
-impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
+impl<'tcx> LinkCollector<'_, 'tcx> {
     /// Given a full link, parse it as an [enum struct variant].
     ///
     /// In particular, this will return an error whenever there aren't three
@@ -339,7 +339,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
         // If there's no third component, we saw `[a::b]` before and it failed to resolve.
         // So there's no partial res.
         let path = split.next().ok_or_else(no_res)?;
-        let ty_res = self.resolve_path(&path, TypeNS, item_id, module_id).ok_or_else(no_res)?;
+        let ty_res = self.resolve_path(path, TypeNS, item_id, module_id).ok_or_else(no_res)?;
 
         match ty_res {
             Res::Def(DefKind::Enum, did) => match tcx.type_of(did).instantiate_identity().kind() {
@@ -559,6 +559,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
             | ty::Coroutine(..)
             | ty::CoroutineWitness(..)
             | ty::Dynamic(..)
+            | ty::UnsafeBinder(_)
             | ty::Param(_)
             | ty::Bound(..)
             | ty::Placeholder(_)
@@ -628,7 +629,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                                 .map(|item| (root_res, item.def_id))
                                 .collect::<Vec<_>>()
                         })
-                        .unwrap_or(Vec::new())
+                        .unwrap_or_default()
                 }
             }
             Res::Def(DefKind::TyAlias, did) => {
@@ -693,7 +694,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                 // Checks if item_name belongs to `impl SomeItem`
                 let mut assoc_items: Vec<_> = tcx
                     .inherent_impls(did)
-                    .into_iter()
+                    .iter()
                     .flat_map(|&imp| {
                         filter_assoc_items_by_name_and_namespace(
                             tcx,
@@ -878,7 +879,7 @@ fn is_derive_trait_collision<T>(ns: &PerNS<Result<Vec<(Res, T)>, ResolutionFailu
     }
 }
 
-impl<'a, 'tcx> DocVisitor<'_> for LinkCollector<'a, 'tcx> {
+impl DocVisitor<'_> for LinkCollector<'_, '_> {
     fn visit_item(&mut self, item: &Item) {
         self.resolve_links(item);
         self.visit_item_recur(item)
@@ -1152,7 +1153,7 @@ impl LinkCollector<'_, '_> {
         }
 
         cache.paths.get(&did).is_some()
-            || cache.external_paths.get(&did).is_some()
+            || cache.external_paths.contains_key(&did)
             || !did.is_local()
     }
 
@@ -1271,7 +1272,7 @@ impl LinkCollector<'_, '_> {
                 }
 
                 res.def_id(self.cx.tcx).map(|page_id| ItemLink {
-                    link: Box::<str>::from(&*diag_info.ori_link),
+                    link: Box::<str>::from(diag_info.ori_link),
                     link_text: link_text.clone(),
                     page_id,
                     fragment,
@@ -1293,7 +1294,7 @@ impl LinkCollector<'_, '_> {
 
                 let page_id = clean::register_res(self.cx, rustc_hir::def::Res::Def(kind, id));
                 Some(ItemLink {
-                    link: Box::<str>::from(&*diag_info.ori_link),
+                    link: Box::<str>::from(diag_info.ori_link),
                     link_text: link_text.clone(),
                     page_id,
                     fragment,
@@ -1333,14 +1334,12 @@ impl LinkCollector<'_, '_> {
             }
 
         // item can be non-local e.g. when using `#[rustc_doc_primitive = "pointer"]`
-        if let Some((src_id, dst_id)) = id.as_local().and_then(|dst_id| {
-            diag_info.item.item_id.expect_def_id().as_local().map(|src_id| (src_id, dst_id))
-        }) {
-            if self.cx.tcx.effective_visibilities(()).is_exported(src_id)
-                && !self.cx.tcx.effective_visibilities(()).is_exported(dst_id)
-            {
-                privacy_error(self.cx, diag_info, path_str);
-            }
+        if let Some(dst_id) = id.as_local()
+            && let Some(src_id) = diag_info.item.item_id.expect_def_id().as_local()
+            && self.cx.tcx.effective_visibilities(()).is_exported(src_id)
+            && !self.cx.tcx.effective_visibilities(()).is_exported(dst_id)
+        {
+            privacy_error(self.cx, diag_info, path_str);
         }
 
         Some(())
@@ -1387,7 +1386,7 @@ impl LinkCollector<'_, '_> {
         )
         .unwrap_or_else(|| item.attr_span(self.cx.tcx));
         rustc_session::parse::feature_err(
-            &self.cx.tcx.sess,
+            self.cx.tcx.sess,
             sym::intra_doc_pointers,
             span,
             "linking to associated items of raw pointers is experimental",
@@ -1404,17 +1403,17 @@ impl LinkCollector<'_, '_> {
         // which we want in some cases but not in others.
         cache_errors: bool,
     ) -> Option<Vec<(Res, Option<UrlFragment>)>> {
-        if let Some(res) = self.visited_links.get(&key) {
-            if res.is_some() || cache_errors {
-                return res.clone().map(|r| vec![r]);
-            }
+        if let Some(res) = self.visited_links.get(&key)
+            && (res.is_some() || cache_errors)
+        {
+            return res.clone().map(|r| vec![r]);
         }
 
         let mut candidates = self.resolve_with_disambiguator(&key, diag.clone());
 
         // FIXME: it would be nice to check that the feature gate was enabled in the original crate, not just ignore it altogether.
         // However I'm not sure how to check that across crates.
-        if let Some(candidate) = candidates.get(0)
+        if let Some(candidate) = candidates.first()
             && candidate.0 == Res::Primitive(PrimitiveType::RawPointer)
             && key.path_str.contains("::")
         // We only want to check this if this is an associated item.
@@ -1431,10 +1430,10 @@ impl LinkCollector<'_, '_> {
         // and after removing duplicated kinds, only one remains, the `ambiguity_error` function
         // won't emit an error. So at this point, we can just take the first candidate as it was
         // the first retrieved and use it to generate the link.
-        if let [candidate, _candidate2, ..] = *candidates {
-            if !ambiguity_error(self.cx, &diag, &key.path_str, &candidates, false) {
-                candidates = vec![candidate];
-            }
+        if let [candidate, _candidate2, ..] = *candidates
+            && !ambiguity_error(self.cx, &diag, &key.path_str, &candidates, false)
+        {
+            candidates = vec![candidate];
         }
 
         let mut out = Vec::with_capacity(candidates.len());
@@ -1479,21 +1478,20 @@ impl LinkCollector<'_, '_> {
                         // See https://github.com/rust-lang/rust/pull/76955#discussion_r493953382 for a good approach.
                         let mut err = ResolutionFailure::NotResolved(err);
                         for other_ns in [TypeNS, ValueNS, MacroNS] {
-                            if other_ns != expected_ns {
-                                if let Ok(&[res, ..]) = self
+                            if other_ns != expected_ns
+                                && let Ok(&[res, ..]) = self
                                     .resolve(path_str, other_ns, None, item_id, module_id)
                                     .as_deref()
-                                {
-                                    err = ResolutionFailure::WrongNamespace {
-                                        res: full_res(self.cx.tcx, res),
-                                        expected_ns,
-                                    };
-                                    break;
-                                }
+                            {
+                                err = ResolutionFailure::WrongNamespace {
+                                    res: full_res(self.cx.tcx, res),
+                                    expected_ns,
+                                };
+                                break;
                             }
                         }
                         resolution_failure(self, diag, path_str, disambiguator, smallvec![err]);
-                        return vec![];
+                        vec![]
                     }
                 }
             }
@@ -1509,15 +1507,12 @@ impl LinkCollector<'_, '_> {
                     type_ns: candidate(TypeNS),
                     value_ns: candidate(ValueNS).and_then(|v_res| {
                         for (res, _) in v_res.iter() {
-                            match res {
-                                // Constructors are picked up in the type namespace.
-                                Res::Def(DefKind::Ctor(..), _) => {
-                                    return Err(ResolutionFailure::WrongNamespace {
-                                        res: *res,
-                                        expected_ns: TypeNS,
-                                    });
-                                }
-                                _ => {}
+                            // Constructors are picked up in the type namespace.
+                            if let Res::Def(DefKind::Ctor(..), _) = res {
+                                return Err(ResolutionFailure::WrongNamespace {
+                                    res: *res,
+                                    expected_ns: TypeNS,
+                                });
                             }
                         }
                         Ok(v_res)
@@ -1536,7 +1531,7 @@ impl LinkCollector<'_, '_> {
                         disambiguator,
                         candidates.into_iter().filter_map(|res| res.err()).collect(),
                     );
-                    return vec![];
+                    vec![]
                 } else if len == 1 {
                     candidates.into_iter().filter_map(|res| res.ok()).flatten().collect::<Vec<_>>()
                 } else {
@@ -1676,11 +1671,11 @@ impl Disambiguator {
             Ok(Some((d, &rest[1..], &rest[1..])))
         } else {
             for (suffix, kind) in suffixes {
-                if let Some(path_str) = link.strip_suffix(suffix) {
-                    // Avoid turning `!` or `()` into an empty string
-                    if !path_str.is_empty() {
-                        return Ok(Some((Kind(kind), path_str, link)));
-                    }
+                // Avoid turning `!` or `()` into an empty string
+                if let Some(path_str) = link.strip_suffix(suffix)
+                    && !path_str.is_empty()
+                {
+                    return Ok(Some((Kind(kind), path_str, link)));
                 }
             }
             Ok(None)
@@ -1850,7 +1845,7 @@ fn report_diagnostic(
                 (sp, MarkdownLinkRange::Destination(md_range))
             }
             MarkdownLinkRange::WholeLink(md_range) => (
-                source_span_for_markdown_range(tcx, dox, &md_range, &item.attrs.doc_strings),
+                source_span_for_markdown_range(tcx, dox, md_range, &item.attrs.doc_strings),
                 link_range.clone(),
             ),
         };
@@ -1979,14 +1974,13 @@ fn resolution_failure(
                         }
 
                         if !path_str.contains("::") {
-                            if disambiguator.map_or(true, |d| d.ns() == MacroNS)
+                            if disambiguator.is_none_or(|d| d.ns() == MacroNS)
                                 && collector
                                     .cx
                                     .tcx
                                     .resolutions(())
                                     .all_macro_rules
-                                    .get(&Symbol::intern(path_str))
-                                    .is_some()
+                                    .contains(&Symbol::intern(path_str))
                             {
                                 diag.note(format!(
                                     "`macro_rules` named `{path_str}` exists in this crate, \
@@ -2063,7 +2057,7 @@ fn resolution_failure(
                                 return;
                             }
                             Trait
-                            | TyAlias { .. }
+                            | TyAlias
                             | ForeignTy
                             | OpaqueTy
                             | TraitAlias
@@ -2171,7 +2165,7 @@ fn disambiguator_error(
     report_diagnostic(cx.tcx, BROKEN_INTRA_DOC_LINKS, msg, &diag_info, |diag, _sp, _link_range| {
         let msg = format!(
             "see {}/rustdoc/write-documentation/linking-to-items-by-name.html#namespaces-and-disambiguators for more info about disambiguators",
-            crate::DOC_RUST_LANG_ORG_CHANNEL
+            crate::DOC_RUST_LANG_ORG_VERSION
         );
         diag.note(msg);
     });

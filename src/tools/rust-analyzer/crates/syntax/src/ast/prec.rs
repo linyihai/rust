@@ -5,7 +5,146 @@ use crate::{
     match_ast, AstNode, SyntaxNode,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub enum ExprPrecedence {
+    // return val, break val, yield val, closures
+    Jump,
+    // = += -= *= /= %= &= |= ^= <<= >>=
+    Assign,
+    // .. ..=
+    Range,
+    // ||
+    LOr,
+    // &&
+    LAnd,
+    // == != < > <= >=
+    Compare,
+    // |
+    BitOr,
+    // ^
+    BitXor,
+    // &
+    BitAnd,
+    // << >>
+    Shift,
+    // + -
+    Sum,
+    // * / %
+    Product,
+    // as
+    Cast,
+    // unary - * ! & &mut
+    Prefix,
+    // function calls, array indexing, field expressions, method calls
+    Postfix,
+    // paths, loops,
+    Unambiguous,
+}
+
+impl ExprPrecedence {
+    pub fn needs_parentheses_in(self, other: ExprPrecedence) -> bool {
+        match other {
+            ExprPrecedence::Unambiguous => false,
+            // postfix ops have higher precedence than any other operator, so we need to wrap
+            // any inner expression that is below
+            ExprPrecedence::Postfix => self < ExprPrecedence::Postfix,
+            // We need to wrap all binary like things, thats everything below prefix except for
+            // jumps (as those are prefix operations as well)
+            ExprPrecedence::Prefix => ExprPrecedence::Jump < self && self < ExprPrecedence::Prefix,
+            parent => self <= parent,
+        }
+    }
+}
+
+#[derive(PartialEq, Debug)]
+pub enum Fixity {
+    /// The operator is left-associative
+    Left,
+    /// The operator is right-associative
+    Right,
+    /// The operator is not associative
+    None,
+}
+
+pub fn precedence(expr: &ast::Expr) -> ExprPrecedence {
+    match expr {
+        Expr::ClosureExpr(closure) => match closure.ret_type() {
+            None => ExprPrecedence::Jump,
+            Some(_) => ExprPrecedence::Unambiguous,
+        },
+
+        Expr::BreakExpr(e) if e.expr().is_some() => ExprPrecedence::Jump,
+        Expr::BecomeExpr(e) if e.expr().is_some() => ExprPrecedence::Jump,
+        Expr::ReturnExpr(e) if e.expr().is_some() => ExprPrecedence::Jump,
+        Expr::YeetExpr(e) if e.expr().is_some() => ExprPrecedence::Jump,
+        Expr::YieldExpr(e) if e.expr().is_some() => ExprPrecedence::Jump,
+
+        Expr::BreakExpr(_)
+        | Expr::BecomeExpr(_)
+        | Expr::ReturnExpr(_)
+        | Expr::YeetExpr(_)
+        | Expr::YieldExpr(_)
+        | Expr::ContinueExpr(_) => ExprPrecedence::Unambiguous,
+
+        Expr::RangeExpr(..) => ExprPrecedence::Range,
+
+        Expr::BinExpr(bin_expr) => match bin_expr.op_kind() {
+            Some(it) => match it {
+                BinaryOp::LogicOp(logic_op) => match logic_op {
+                    ast::LogicOp::And => ExprPrecedence::LAnd,
+                    ast::LogicOp::Or => ExprPrecedence::LOr,
+                },
+                BinaryOp::ArithOp(arith_op) => match arith_op {
+                    ast::ArithOp::Add | ast::ArithOp::Sub => ExprPrecedence::Sum,
+                    ast::ArithOp::Div | ast::ArithOp::Rem | ast::ArithOp::Mul => {
+                        ExprPrecedence::Product
+                    }
+                    ast::ArithOp::Shl | ast::ArithOp::Shr => ExprPrecedence::Shift,
+                    ast::ArithOp::BitXor => ExprPrecedence::BitXor,
+                    ast::ArithOp::BitOr => ExprPrecedence::BitOr,
+                    ast::ArithOp::BitAnd => ExprPrecedence::BitAnd,
+                },
+                BinaryOp::CmpOp(_) => ExprPrecedence::Compare,
+                BinaryOp::Assignment { .. } => ExprPrecedence::Assign,
+            },
+            None => ExprPrecedence::Unambiguous,
+        },
+        Expr::CastExpr(_) => ExprPrecedence::Cast,
+
+        Expr::LetExpr(_) | Expr::PrefixExpr(_) | Expr::RefExpr(_) => ExprPrecedence::Prefix,
+
+        Expr::AwaitExpr(_)
+        | Expr::CallExpr(_)
+        | Expr::FieldExpr(_)
+        | Expr::IndexExpr(_)
+        | Expr::MethodCallExpr(_)
+        | Expr::TryExpr(_) => ExprPrecedence::Postfix,
+
+        Expr::ArrayExpr(_)
+        | Expr::AsmExpr(_)
+        | Expr::BlockExpr(_)
+        | Expr::ForExpr(_)
+        | Expr::FormatArgsExpr(_)
+        | Expr::IfExpr(_)
+        | Expr::Literal(_)
+        | Expr::LoopExpr(_)
+        | Expr::MacroExpr(_)
+        | Expr::MatchExpr(_)
+        | Expr::OffsetOfExpr(_)
+        | Expr::ParenExpr(_)
+        | Expr::PathExpr(_)
+        | Expr::RecordExpr(_)
+        | Expr::TupleExpr(_)
+        | Expr::UnderscoreExpr(_)
+        | Expr::WhileExpr(_) => ExprPrecedence::Unambiguous,
+    }
+}
+
 impl Expr {
+    pub fn precedence(&self) -> ExprPrecedence {
+        precedence(self)
+    }
+
     // Implementation is based on
     // - https://doc.rust-lang.org/reference/expressions.html#expression-precedence
     // - https://matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html
@@ -13,7 +152,7 @@ impl Expr {
     //   - https://github.com/rust-lang/rust/blob/b6852428a8ea9728369b64b9964cad8e258403d3/compiler/rustc_ast/src/util/parser.rs#L296
 
     /// Returns `true` if `self` would need to be wrapped in parentheses given that its parent is `parent`.
-    pub fn needs_parens_in(&self, parent: SyntaxNode) -> bool {
+    pub fn needs_parens_in(&self, parent: &SyntaxNode) -> bool {
         match_ast! {
             match parent {
                 ast::Expr(e) => self.needs_parens_in_expr(&e),
@@ -261,7 +400,7 @@ impl Expr {
     }
 
     /// Returns true if self is one of `return`, `break`, `continue` or `yield` with **no associated value**.
-    fn is_ret_like_with_no_value(&self) -> bool {
+    pub fn is_ret_like_with_no_value(&self) -> bool {
         use Expr::*;
 
         match self {
@@ -269,6 +408,7 @@ impl Expr {
             BreakExpr(e) => e.expr().is_none(),
             ContinueExpr(_) => true,
             YieldExpr(e) => e.expr().is_none(),
+            BecomeExpr(e) => e.expr().is_none(),
             _ => false,
         }
     }

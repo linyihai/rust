@@ -26,7 +26,7 @@ use rustc_middle::mir::interpret::{
 };
 use rustc_middle::ty::layout::{LayoutCx, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Ty};
-use rustc_span::symbol::{Symbol, sym};
+use rustc_span::{Symbol, sym};
 use tracing::trace;
 
 use super::machine::AllocMap;
@@ -302,7 +302,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
                     };
                 }
             }
-            Variants::Single { .. } => {}
+            Variants::Single { .. } | Variants::Empty => {}
         }
 
         // Now we know we are projecting to a field, so figure out which one.
@@ -344,6 +344,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
                         // Inside a variant
                         PathElem::Field(def.variant(index).fields[FieldIdx::from_usize(field)].name)
                     }
+                    Variants::Empty => panic!("there is no field in Variants::Empty types"),
                     Variants::Multiple { .. } => bug!("we handled variants above"),
                 }
             }
@@ -767,6 +768,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
                 // Nothing to check.
                 interp_ok(true)
             }
+            ty::UnsafeBinder(_) => todo!("FIXME(unsafe_binder)"),
             // The above should be all the primitive types. The rest is compound, we
             // check them by visiting their fields/variants.
             ty::Adt(..)
@@ -810,10 +812,10 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
                 if start == 1 && end == max_value {
                     // Only null is the niche. So make sure the ptr is NOT null.
                     if self.ecx.scalar_may_be_null(scalar)? {
-                        throw_validation_failure!(self.path, NullablePtrOutOfRange {
-                            range: valid_range,
-                            max_value
-                        })
+                        throw_validation_failure!(
+                            self.path,
+                            NullablePtrOutOfRange { range: valid_range, max_value }
+                        )
                     } else {
                         return interp_ok(());
                     }
@@ -823,10 +825,10 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
                 } else {
                     // Conservatively, we reject, because the pointer *could* have a bad
                     // value.
-                    throw_validation_failure!(self.path, PtrOutOfRange {
-                        range: valid_range,
-                        max_value
-                    })
+                    throw_validation_failure!(
+                        self.path,
+                        PtrOutOfRange { range: valid_range, max_value }
+                    )
                 }
             }
         };
@@ -834,11 +836,10 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
         if valid_range.contains(bits) {
             interp_ok(())
         } else {
-            throw_validation_failure!(self.path, OutOfRange {
-                value: format!("{bits}"),
-                range: valid_range,
-                max_value
-            })
+            throw_validation_failure!(
+                self.path,
+                OutOfRange { value: format!("{bits}"), range: valid_range, max_value }
+            )
         }
     }
 
@@ -1010,7 +1011,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
             }
             // Don't forget potential other variants.
             match &layout.variants {
-                Variants::Single { .. } => {
+                Variants::Single { .. } | Variants::Empty => {
                     // Fully handled above.
                 }
                 Variants::Multiple { variants, .. } => {
@@ -1238,6 +1239,17 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValueVisitor<'tcx, M> for ValidityVisitor<'rt,
                     self.visit_field(val, 0, &self.ecx.project_index(val, 0)?)?;
                 }
             }
+            ty::Pat(base, pat) => {
+                // First check that the base type is valid
+                self.visit_value(&val.transmute(self.ecx.layout_of(*base)?, self.ecx)?)?;
+                // When you extend this match, make sure to also add tests to
+                // tests/ui/type/pattern_types/validity.rs((
+                match **pat {
+                    // Range patterns are precisely reflected into `valid_range` and thus
+                    // handled fully by `visit_scalar` (called below).
+                    ty::PatternKind::Range { .. } => {},
+                }
+            }
             _ => {
                 // default handler
                 try_validation!(
@@ -1252,21 +1264,20 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValueVisitor<'tcx, M> for ValidityVisitor<'rt,
             }
         }
 
-        // *After* all of this, check the ABI. We need to check the ABI to handle
-        // types like `NonNull` where the `Scalar` info is more restrictive than what
-        // the fields say (`rustc_layout_scalar_valid_range_start`).
-        // But in most cases, this will just propagate what the fields say,
-        // and then we want the error to point at the field -- so, first recurse,
-        // then check ABI.
+        // *After* all of this, check further information stored in the layout. We need to check
+        // this to handle types like `NonNull` where the `Scalar` info is more restrictive than what
+        // the fields say (`rustc_layout_scalar_valid_range_start`). But in most cases, this will
+        // just propagate what the fields say, and then we want the error to point at the field --
+        // so, we first recurse, then we do this check.
         //
         // FIXME: We could avoid some redundant checks here. For newtypes wrapping
         // scalars, we do the same check on every "level" (e.g., first we check
         // MyNewtype and then the scalar in there).
+        if val.layout.is_uninhabited() {
+            let ty = val.layout.ty;
+            throw_validation_failure!(self.path, UninhabitedVal { ty });
+        }
         match val.layout.backend_repr {
-            BackendRepr::Uninhabited => {
-                let ty = val.layout.ty;
-                throw_validation_failure!(self.path, UninhabitedVal { ty });
-            }
             BackendRepr::Scalar(scalar_layout) => {
                 if !scalar_layout.is_uninit_valid() {
                     // There is something to check here.
@@ -1285,7 +1296,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValueVisitor<'tcx, M> for ValidityVisitor<'rt,
                     self.visit_scalar(b, b_layout)?;
                 }
             }
-            BackendRepr::Vector { .. } => {
+            BackendRepr::SimdVector { .. } => {
                 // No checks here, we assume layout computation gets this right.
                 // (This is harder to check since Miri does not represent these as `Immediate`. We
                 // also cannot use field projections since this might be a newtype around a vector.)

@@ -1,6 +1,7 @@
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::{iter, mem};
 
 use rustc_ast as ast;
@@ -16,7 +17,6 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
-use rustc_data_structures::sync::Lrc;
 use rustc_errors::PResult;
 use rustc_feature::Features;
 use rustc_parse::parser::{
@@ -29,8 +29,7 @@ use rustc_session::lint::builtin::{UNUSED_ATTRIBUTES, UNUSED_DOC_COMMENTS};
 use rustc_session::parse::feature_err;
 use rustc_session::{Limit, Session};
 use rustc_span::hygiene::SyntaxContext;
-use rustc_span::symbol::{Ident, sym};
-use rustc_span::{ErrorGuaranteed, FileName, LocalExpnId, Span};
+use rustc_span::{ErrorGuaranteed, FileName, Ident, LocalExpnId, Span, sym};
 use smallvec::SmallVec;
 
 use crate::base::*;
@@ -228,6 +227,12 @@ ast_fragments! {
     Variants(SmallVec<[ast::Variant; 1]>) {
         "variant"; many fn flat_map_variant; fn visit_variant(); fn make_variants;
     }
+    WherePredicates(SmallVec<[ast::WherePredicate; 1]>) {
+        "where predicate";
+        many fn flat_map_where_predicate;
+        fn visit_where_predicate();
+        fn make_where_predicates;
+     }
     Crate(ast::Crate) { "crate"; one fn visit_crate; fn visit_crate; fn make_crate; }
 }
 
@@ -260,7 +265,8 @@ impl AstFragmentKind {
             | AstFragmentKind::GenericParams
             | AstFragmentKind::Params
             | AstFragmentKind::FieldDefs
-            | AstFragmentKind::Variants => SupportsMacroExpansion::No,
+            | AstFragmentKind::Variants
+            | AstFragmentKind::WherePredicates => SupportsMacroExpansion::No,
         }
     }
 
@@ -291,6 +297,9 @@ impl AstFragmentKind {
             AstFragmentKind::Variants => {
                 AstFragment::Variants(items.map(Annotatable::expect_variant).collect())
             }
+            AstFragmentKind::WherePredicates => AstFragment::WherePredicates(
+                items.map(Annotatable::expect_where_predicate).collect(),
+            ),
             AstFragmentKind::Items => {
                 AstFragment::Items(items.map(Annotatable::expect_item).collect())
             }
@@ -580,7 +589,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
         &mut self,
         mut fragment: AstFragment,
         extra_placeholders: &[NodeId],
-    ) -> (AstFragment, Vec<(Invocation, Option<Lrc<SyntaxExtension>>)>) {
+    ) -> (AstFragment, Vec<(Invocation, Option<Arc<SyntaxExtension>>)>) {
         // Resolve `$crate`s in the fragment for pretty-printing.
         self.cx.resolver.resolve_dollar_crates();
 
@@ -723,7 +732,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                                     item_inner.kind,
                                     ItemKind::Mod(
                                         _,
-                                        ModKind::Unloaded | ModKind::Loaded(_, Inline::No, _),
+                                        ModKind::Unloaded | ModKind::Loaded(_, Inline::No, _, _),
                                     )
                                 ) =>
                         {
@@ -732,7 +741,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                         _ => item.to_tokens(),
                     };
                     let attr_item = attr.unwrap_normal_item();
-                    if let AttrArgs::Eq(..) = attr_item.args {
+                    if let AttrArgs::Eq { .. } = attr_item.args {
                         self.cx.dcx().emit_err(UnsupportedKeyValue { span });
                     }
                     let inner_tokens = attr_item.args.inner_tokens();
@@ -866,7 +875,8 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
             | Annotatable::GenericParam(..)
             | Annotatable::Param(..)
             | Annotatable::FieldDef(..)
-            | Annotatable::Variant(..) => panic!("unexpected annotatable"),
+            | Annotatable::Variant(..)
+            | Annotatable::WherePredicate(..) => panic!("unexpected annotatable"),
         };
         if self.cx.ecfg.features.proc_macro_hygiene() {
             return;
@@ -889,7 +899,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
             fn visit_item(&mut self, item: &'ast ast::Item) {
                 match &item.kind {
                     ItemKind::Mod(_, mod_kind)
-                        if !matches!(mod_kind, ModKind::Loaded(_, Inline::Yes, _)) =>
+                        if !matches!(mod_kind, ModKind::Loaded(_, Inline::Yes, _, _)) =>
                     {
                         feature_err(
                             self.sess,
@@ -990,7 +1000,7 @@ pub fn parse_ast_fragment<'a>(
             }
         }
         AstFragmentKind::Ty => AstFragment::Ty(this.parse_ty()?),
-        AstFragmentKind::Pat => AstFragment::Pat(this.parse_pat_allow_top_alt(
+        AstFragmentKind::Pat => AstFragment::Pat(this.parse_pat_allow_top_guard(
             None,
             RecoverComma::No,
             RecoverColon::Yes,
@@ -1003,7 +1013,8 @@ pub fn parse_ast_fragment<'a>(
         | AstFragmentKind::GenericParams
         | AstFragmentKind::Params
         | AstFragmentKind::FieldDefs
-        | AstFragmentKind::Variants => panic!("unexpected AST fragment kind"),
+        | AstFragmentKind::Variants
+        | AstFragmentKind::WherePredicates => panic!("unexpected AST fragment kind"),
     })
 }
 
@@ -1195,7 +1206,7 @@ impl InvocationCollectorNode for P<ast::Item> {
 
         let ecx = &mut collector.cx;
         let (file_path, dir_path, dir_ownership) = match mod_kind {
-            ModKind::Loaded(_, inline, _) => {
+            ModKind::Loaded(_, inline, _, _) => {
                 // Inline `mod foo { ... }`, but we still need to push directories.
                 let (dir_path, dir_ownership) = mod_dir_path(
                     ecx.sess,
@@ -1217,15 +1228,21 @@ impl InvocationCollectorNode for P<ast::Item> {
             ModKind::Unloaded => {
                 // We have an outline `mod foo;` so we need to parse the file.
                 let old_attrs_len = attrs.len();
-                let ParsedExternalMod { items, spans, file_path, dir_path, dir_ownership } =
-                    parse_external_mod(
-                        ecx.sess,
-                        ident,
-                        span,
-                        &ecx.current_expansion.module,
-                        ecx.current_expansion.dir_ownership,
-                        &mut attrs,
-                    );
+                let ParsedExternalMod {
+                    items,
+                    spans,
+                    file_path,
+                    dir_path,
+                    dir_ownership,
+                    had_parse_error,
+                } = parse_external_mod(
+                    ecx.sess,
+                    ident,
+                    span,
+                    &ecx.current_expansion.module,
+                    ecx.current_expansion.dir_ownership,
+                    &mut attrs,
+                );
 
                 if let Some(lint_store) = ecx.lint_store {
                     lint_store.pre_expansion_lint(
@@ -1239,7 +1256,7 @@ impl InvocationCollectorNode for P<ast::Item> {
                     );
                 }
 
-                *mod_kind = ModKind::Loaded(items, Inline::No, spans);
+                *mod_kind = ModKind::Loaded(items, Inline::No, spans, had_parse_error);
                 node.attrs = attrs;
                 if node.attrs.len() > old_attrs_len {
                     // If we loaded an out-of-line module and added some inner attributes,
@@ -1382,7 +1399,7 @@ impl InvocationCollectorNode for P<ast::ForeignItem> {
         fragment.make_foreign_items()
     }
     fn walk_flat_map<V: MutVisitor>(self, visitor: &mut V) -> Self::OutputTy {
-        walk_flat_map_item(visitor, self)
+        walk_flat_map_foreign_item(visitor, self)
     }
     fn is_mac_call(&self) -> bool {
         matches!(self.kind, ForeignItemKind::MacCall(..))
@@ -1406,6 +1423,19 @@ impl InvocationCollectorNode for ast::Variant {
     }
     fn walk_flat_map<V: MutVisitor>(self, visitor: &mut V) -> Self::OutputTy {
         walk_flat_map_variant(visitor, self)
+    }
+}
+
+impl InvocationCollectorNode for ast::WherePredicate {
+    const KIND: AstFragmentKind = AstFragmentKind::WherePredicates;
+    fn to_annotatable(self) -> Annotatable {
+        Annotatable::WherePredicate(self)
+    }
+    fn fragment_to_output(fragment: AstFragment) -> Self::OutputTy {
+        fragment.make_where_predicates()
+    }
+    fn walk_flat_map<V: MutVisitor>(self, visitor: &mut V) -> Self::OutputTy {
+        walk_flat_map_where_predicate(visitor, self)
     }
 }
 
@@ -1769,7 +1799,7 @@ fn build_single_delegations<'a, Node: InvocationCollectorNode>(
 
 struct InvocationCollector<'a, 'b> {
     cx: &'a mut ExtCtxt<'b>,
-    invocations: Vec<(Invocation, Option<Lrc<SyntaxExtension>>)>,
+    invocations: Vec<(Invocation, Option<Arc<SyntaxExtension>>)>,
     monotonic: bool,
 }
 
@@ -1907,7 +1937,7 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
                     self.cx.current_expansion.lint_node_id,
                     BuiltinLintDiag::UnusedDocComment(attr.span),
                 );
-            } else if rustc_attr::is_builtin_attr(attr) {
+            } else if rustc_attr_parsing::is_builtin_attr(attr) {
                 let attr_name = attr.ident().unwrap().name;
                 // `#[cfg]` and `#[cfg_attr]` are special - they are
                 // eagerly evaluated.
@@ -2108,6 +2138,13 @@ impl<'a, 'b> MutVisitor for InvocationCollector<'a, 'b> {
     }
 
     fn flat_map_variant(&mut self, node: ast::Variant) -> SmallVec<[ast::Variant; 1]> {
+        self.flat_map_node(node)
+    }
+
+    fn flat_map_where_predicate(
+        &mut self,
+        node: ast::WherePredicate,
+    ) -> SmallVec<[ast::WherePredicate; 1]> {
         self.flat_map_node(node)
     }
 

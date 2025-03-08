@@ -1,20 +1,15 @@
-use rustc_data_structures::fx::FxIndexSet;
 use rustc_infer::infer::InferOk;
 use rustc_infer::infer::resolve::OpportunisticRegionResolver;
 use rustc_infer::traits::query::type_op::ImpliedOutlivesBounds;
 use rustc_macros::extension;
 use rustc_middle::infer::canonical::{OriginalQueryValues, QueryRegionConstraints};
-use rustc_middle::span_bug;
 pub use rustc_middle::traits::query::OutlivesBound;
 use rustc_middle::ty::{self, ParamEnv, Ty, TypeFolder, TypeVisitableExt};
 use rustc_span::def_id::LocalDefId;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
 use crate::infer::InferCtxt;
 use crate::traits::{ObligationCause, ObligationCtxt};
-
-pub type BoundsCompat<'a, 'tcx: 'a> = impl Iterator<Item = OutlivesBound<'tcx>> + 'a;
-pub type Bounds<'a, 'tcx: 'a> = impl Iterator<Item = OutlivesBound<'tcx>> + 'a;
 
 /// Implied bounds are region relationships that we deduce
 /// automatically. The idea is that (e.g.) a caller must check that a
@@ -41,7 +36,7 @@ fn implied_outlives_bounds<'a, 'tcx>(
     param_env: ty::ParamEnv<'tcx>,
     body_id: LocalDefId,
     ty: Ty<'tcx>,
-    compat: bool,
+    disable_implied_bounds_hack: bool,
 ) -> Vec<OutlivesBound<'tcx>> {
     let ty = infcx.resolve_vars_if_possible(ty);
     let ty = OpportunisticRegionResolver::new(infcx).fold_ty(ty);
@@ -57,11 +52,8 @@ fn implied_outlives_bounds<'a, 'tcx>(
     let mut canonical_var_values = OriginalQueryValues::default();
     let input = ImpliedOutlivesBounds { ty };
     let canonical = infcx.canonicalize_query(param_env.and(input), &mut canonical_var_values);
-    let implied_bounds_result = if compat {
-        infcx.tcx.implied_outlives_bounds_compat(canonical)
-    } else {
-        infcx.tcx.implied_outlives_bounds(canonical)
-    };
+    let implied_bounds_result =
+        infcx.tcx.implied_outlives_bounds((canonical, disable_implied_bounds_hack));
     let Ok(canonical_result) = implied_bounds_result else {
         return vec![];
     };
@@ -86,16 +78,12 @@ fn implied_outlives_bounds<'a, 'tcx>(
     bounds.retain(|bound| !bound.has_placeholders());
 
     if !constraints.is_empty() {
-        debug!(?constraints);
-        if !constraints.member_constraints.is_empty() {
-            span_bug!(span, "{:#?}", constraints.member_constraints);
-        }
-
+        let QueryRegionConstraints { outlives } = constraints;
         // Instantiation may have produced new inference variables and constraints on those
         // variables. Process these constraints.
         let ocx = ObligationCtxt::new(infcx);
         let cause = ObligationCause::misc(span, body_id);
-        for &constraint in &constraints.outlives {
+        for &constraint in &outlives {
             ocx.register_obligation(infcx.query_outlives_constraint_to_obligation(
                 constraint,
                 cause.clone(),
@@ -115,36 +103,19 @@ fn implied_outlives_bounds<'a, 'tcx>(
     bounds
 }
 
-#[extension(pub trait InferCtxtExt<'a, 'tcx>)]
-impl<'a, 'tcx: 'a> InferCtxt<'tcx> {
-    /// Do *NOT* call this directly.
-    fn implied_bounds_tys_compat(
-        &'a self,
-        param_env: ParamEnv<'tcx>,
+#[extension(pub trait InferCtxtExt<'tcx>)]
+impl<'tcx> InferCtxt<'tcx> {
+    /// Do *NOT* call this directly. You probably want to construct a `OutlivesEnvironment`
+    /// instead if you're interested in the implied bounds for a given signature.
+    fn implied_bounds_tys<Tys: IntoIterator<Item = Ty<'tcx>>>(
+        &self,
         body_id: LocalDefId,
-        tys: &'a FxIndexSet<Ty<'tcx>>,
-        compat: bool,
-    ) -> BoundsCompat<'a, 'tcx> {
-        tys.iter()
-            .flat_map(move |ty| implied_outlives_bounds(self, param_env, body_id, *ty, compat))
-    }
-
-    /// If `-Z no-implied-bounds-compat` is set, calls `implied_bounds_tys_compat`
-    /// with `compat` set to `true`, otherwise `false`.
-    fn implied_bounds_tys(
-        &'a self,
         param_env: ParamEnv<'tcx>,
-        body_id: LocalDefId,
-        tys: &'a FxIndexSet<Ty<'tcx>>,
-    ) -> Bounds<'a, 'tcx> {
-        tys.iter().flat_map(move |ty| {
-            implied_outlives_bounds(
-                self,
-                param_env,
-                body_id,
-                *ty,
-                !self.tcx.sess.opts.unstable_opts.no_implied_bounds_compat,
-            )
+        tys: Tys,
+        disable_implied_bounds_hack: bool,
+    ) -> impl Iterator<Item = OutlivesBound<'tcx>> {
+        tys.into_iter().flat_map(move |ty| {
+            implied_outlives_bounds(self, param_env, body_id, ty, disable_implied_bounds_hack)
         })
     }
 }

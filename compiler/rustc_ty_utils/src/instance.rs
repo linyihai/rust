@@ -49,7 +49,8 @@ fn resolve_instance_raw<'tcx>(
                     | ty::Adt(..)
                     | ty::Dynamic(..)
                     | ty::Array(..)
-                    | ty::Slice(..) => {}
+                    | ty::Slice(..)
+                    | ty::UnsafeBinder(..) => {}
                     // Drop shims can only be built from ADTs.
                     _ => return Ok(None),
                 }
@@ -111,6 +112,7 @@ fn resolve_associated_item<'tcx>(
             | CodegenObligationError::Unimplemented
             | CodegenObligationError::FulfillmentError,
         ) => return Ok(None),
+        Err(CodegenObligationError::UnconstrainedParam(guar)) => return Err(guar),
     };
 
     // Now that we know which impl is being used, we can dispatch to
@@ -133,8 +135,10 @@ fn resolve_associated_item<'tcx>(
                     bug!("{:?} not found in {:?}", trait_item_id, impl_data.impl_def_id);
                 });
 
-            // Since this is a trait item, we need to see if the item is either a trait default item
-            // or a specialization because we can't resolve those unless we can `Reveal::All`.
+            // Since this is a trait item, we need to see if the item is either a trait
+            // default item or a specialization because we can't resolve those until we're
+            // in `TypingMode::PostAnalysis`.
+            //
             // NOTE: This should be kept in sync with the similar code in
             // `rustc_trait_selection::traits::project::assemble_candidates_from_impls()`.
             let eligible = if leaf_def.is_final() {
@@ -147,7 +151,8 @@ fn resolve_associated_item<'tcx>(
                 // get a result which isn't correct for all monomorphizations.
                 match typing_env.typing_mode {
                     ty::TypingMode::Coherence
-                    | ty::TypingMode::Analysis { defining_opaque_types: _ } => false,
+                    | ty::TypingMode::Analysis { .. }
+                    | ty::TypingMode::PostBorrowckAnalysis { .. } => false,
                     ty::TypingMode::PostAnalysis => !trait_ref.still_further_specializable(),
                 }
             };
@@ -155,7 +160,7 @@ fn resolve_associated_item<'tcx>(
                 return Ok(None);
             }
 
-            let typing_env = typing_env.with_reveal_all_normalized(tcx);
+            let typing_env = typing_env.with_post_analysis_normalized(tcx);
             let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
             let args = rcvr_args.rebase_onto(tcx, trait_def_id, impl_data.args);
             let args = translate_args(
@@ -213,15 +218,15 @@ fn resolve_associated_item<'tcx>(
 
             let args = tcx.erase_regions(args);
 
-            // Check if we just resolved an associated `const` declaration from
-            // a `trait` to an associated `const` definition in an `impl`, where
-            // the definition in the `impl` has the wrong type (for which an
-            // error has already been/will be emitted elsewhere).
-            if leaf_def.item.kind == ty::AssocKind::Const
-                && trait_item_id != leaf_def.item.def_id
+            // We check that the impl item is compatible with the trait item
+            // because otherwise we may ICE in const eval due to type mismatches,
+            // signature incompatibilities, etc.
+            // NOTE: We could also only enforce this in `PostAnalysis`, which
+            // is what CTFE and MIR inlining would care about anyways.
+            if trait_item_id != leaf_def.item.def_id
                 && let Some(leaf_def_item) = leaf_def.item.def_id.as_local()
             {
-                tcx.compare_impl_const((leaf_def_item, trait_item_id))?;
+                tcx.ensure_ok().compare_impl_item(leaf_def_item)?;
             }
 
             Some(ty::Instance::new(leaf_def.item.def_id, args))
@@ -244,7 +249,7 @@ fn resolve_associated_item<'tcx>(
                 })
             }
         }
-        traits::ImplSource::Builtin(BuiltinImplSource::Misc, _) => {
+        traits::ImplSource::Builtin(BuiltinImplSource::Misc | BuiltinImplSource::Trivial, _) => {
             if tcx.is_lang_item(trait_ref.def_id, LangItem::Clone) {
                 // FIXME(eddyb) use lang items for methods instead of names.
                 let name = tcx.item_name(trait_item_id);
@@ -376,8 +381,7 @@ fn resolve_associated_item<'tcx>(
             }
         }
         traits::ImplSource::Param(..)
-        | traits::ImplSource::Builtin(BuiltinImplSource::TraitUpcasting { .. }, _)
-        | traits::ImplSource::Builtin(BuiltinImplSource::TupleUnsizing, _) => None,
+        | traits::ImplSource::Builtin(BuiltinImplSource::TraitUpcasting { .. }, _) => None,
     })
 }
 

@@ -11,6 +11,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::Index;
+use std::sync::Arc;
 
 use rustc_abi::{FieldIdx, Integer, Size, VariantIdx};
 use rustc_ast::{AsmMacro, InlineAsmOptions, InlineAsmTemplatePiece};
@@ -19,27 +20,25 @@ use rustc_hir::def_id::DefId;
 use rustc_hir::{BindingMode, ByRef, HirId, MatchSource, RangeEnd};
 use rustc_index::{IndexVec, newtype_index};
 use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeVisitable};
-use rustc_middle::middle::region;
-use rustc_middle::mir::interpret::AllocId;
-use rustc_middle::mir::{self, BinOp, BorrowKind, FakeReadCause, UnOp};
-use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::layout::IntegerExt;
-use rustc_middle::ty::{
-    self, AdtDef, CanonicalUserType, CanonicalUserTypeAnnotation, FnSig, GenericArgsRef, List, Ty,
-    TyCtxt, UpvarArgs,
-};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
 use rustc_target::asm::InlineAsmRegOrRegClass;
 use tracing::instrument;
 
+use crate::middle::region;
+use crate::mir::interpret::AllocId;
+use crate::mir::{self, BinOp, BorrowKind, FakeReadCause, UnOp};
+use crate::ty::adjustment::PointerCoercion;
+use crate::ty::layout::IntegerExt;
+use crate::ty::{
+    self, AdtDef, CanonicalUserType, CanonicalUserTypeAnnotation, FnSig, GenericArgsRef, List, Ty,
+    TyCtxt, UpvarArgs,
+};
+
 pub mod visit;
 
 macro_rules! thir_with_elements {
     (
-        $($field_name:ident: $field_ty:ty,)*
-
-    @elements:
         $($name:ident: $id:ty => $value:ty => $format:literal,)*
     ) => {
         $(
@@ -50,25 +49,24 @@ macro_rules! thir_with_elements {
             }
         )*
 
+        // Note: Making `Thir` implement `Clone` is useful for external tools that need access to
+        // THIR bodies even after the `Steal` query result has been stolen.
+        // One such tool is https://github.com/rust-corpus/qrates/.
         /// A container for a THIR body.
         ///
         /// This can be indexed directly by any THIR index (e.g. [`ExprId`]).
         #[derive(Debug, HashStable, Clone)]
         pub struct Thir<'tcx> {
-            $(
-                pub $field_name: $field_ty,
-            )*
+            pub body_type: BodyTy<'tcx>,
             $(
                 pub $name: IndexVec<$id, $value>,
             )*
         }
 
         impl<'tcx> Thir<'tcx> {
-            pub fn new($($field_name: $field_ty,)*) -> Thir<'tcx> {
+            pub fn new(body_type: BodyTy<'tcx>) -> Thir<'tcx> {
                 Thir {
-                    $(
-                        $field_name,
-                    )*
+                    body_type,
                     $(
                         $name: IndexVec::new(),
                     )*
@@ -88,9 +86,6 @@ macro_rules! thir_with_elements {
 }
 
 thir_with_elements! {
-    body_type: BodyTy<'tcx>,
-
-@elements:
     arms: ArmId => Arm<'tcx> => "a{}",
     blocks: BlockId => Block => "b{}",
     exprs: ExprId => Expr<'tcx> => "e{}",
@@ -102,6 +97,7 @@ thir_with_elements! {
 pub enum BodyTy<'tcx> {
     Const(Ty<'tcx>),
     Fn(FnSig<'tcx>),
+    GlobalAsm(Ty<'tcx>),
 }
 
 /// Description of a type-checked function parameter.
@@ -158,8 +154,21 @@ pub struct AdtExpr<'tcx> {
     pub user_ty: UserTy<'tcx>,
 
     pub fields: Box<[FieldExpr]>,
-    /// The base, e.g. `Foo {x: 1, .. base}`.
-    pub base: Option<FruInfo<'tcx>>,
+    /// The base, e.g. `Foo {x: 1, ..base}`.
+    pub base: AdtExprBase<'tcx>,
+}
+
+#[derive(Clone, Debug, HashStable)]
+pub enum AdtExprBase<'tcx> {
+    /// A struct expression where all the fields are explicitly enumerated: `Foo { a, b }`.
+    None,
+    /// A struct expression with a "base", an expression of the same type as the outer struct that
+    /// will be used to populate any fields not explicitly mentioned: `Foo { ..base }`
+    Base(FruInfo<'tcx>),
+    /// A struct expression with a `..` tail but no "base" expression. The values from the struct
+    /// fields' default values will be used to populate any fields not explicitly mentioned:
+    /// `Foo { .. }`.
+    DefaultFields(Box<[Ty<'tcx>]>),
 }
 
 #[derive(Clone, Debug, HashStable)]
@@ -247,11 +256,22 @@ pub struct Expr<'tcx> {
     pub ty: Ty<'tcx>,
 
     /// The lifetime of this expression if it should be spilled into a
-    /// temporary; should be `None` only if in a constant context
-    pub temp_lifetime: Option<region::Scope>,
+    /// temporary
+    pub temp_lifetime: TempLifetime,
 
     /// span of the expression in the source
     pub span: Span,
+}
+
+/// Temporary lifetime information for THIR expressions
+#[derive(Clone, Copy, Debug, HashStable)]
+pub struct TempLifetime {
+    /// Lifetime for temporaries as expected.
+    /// This should be `None` in a constant context.
+    pub temp_lifetime: Option<region::Scope>,
+    /// If `Some(lt)`, indicates that the lifetime of this temporary will change to `lt` in a future edition.
+    /// If `None`, then no changes are expected, or lints are disabled.
+    pub backwards_incompatible: Option<region::Scope>,
 }
 
 #[derive(Clone, Debug, HashStable)]
@@ -294,6 +314,14 @@ pub enum ExprKind<'tcx> {
         /// The span of the function, without the dot and receiver
         /// (e.g. `foo(a, b)` in `x.foo(a, b)`).
         fn_span: Span,
+    },
+    /// A use expression `x.use`.
+    ByUse {
+        /// The expression on which use is applied.
+        expr: ExprId,
+        /// The span of use, without the dot and receiver
+        /// (e.g. `use` in `x.use`).
+        span: Span,
     },
     /// A *non-overloaded* dereference.
     Deref {
@@ -360,7 +388,6 @@ pub enum ExprKind<'tcx> {
     /// A `match` expression.
     Match {
         scrutinee: ExprId,
-        scrutinee_hir_id: HirId,
         arms: Box<[ArmId]>,
         match_source: MatchSource,
     },
@@ -464,6 +491,19 @@ pub enum ExprKind<'tcx> {
         /// Type that the user gave to this expression
         user_ty: UserTy<'tcx>,
         user_ty_span: Span,
+    },
+    /// An unsafe binder cast on a place, e.g. `unwrap_binder!(*ptr)`.
+    PlaceUnwrapUnsafeBinder {
+        source: ExprId,
+    },
+    /// An unsafe binder cast on a value, e.g. `unwrap_binder!(rvalue())`,
+    /// which makes a temporary.
+    ValueUnwrapUnsafeBinder {
+        source: ExprId,
+    },
+    /// Construct an unsafe binder, e.g. `wrap_binder(&ref)`.
+    WrapUnsafeBinder {
+        source: ExprId,
     },
     /// A closure definition.
     Closure(Box<ClosureExpr<'tcx>>),
@@ -577,8 +617,7 @@ pub enum InlineAsmOperand<'tcx> {
         span: Span,
     },
     SymFn {
-        value: mir::Const<'tcx>,
-        span: Span,
+        value: ExprId,
     },
     SymStatic {
         def_id: DefId,
@@ -591,7 +630,7 @@ pub enum InlineAsmOperand<'tcx> {
 #[derive(Clone, Debug, HashStable, TypeVisitable)]
 pub struct FieldPat<'tcx> {
     pub field: FieldIdx,
-    pub pattern: Box<Pat<'tcx>>,
+    pub pattern: Pat<'tcx>,
 }
 
 #[derive(Clone, Debug, HashStable, TypeVisitable)]
@@ -645,14 +684,13 @@ impl<'tcx> Pat<'tcx> {
             | Binding { subpattern: Some(subpattern), .. }
             | Deref { subpattern }
             | DerefPattern { subpattern, .. }
-            | InlineConstant { subpattern, .. } => subpattern.walk_(it),
+            | ExpandedConstant { subpattern, .. } => subpattern.walk_(it),
             Leaf { subpatterns } | Variant { subpatterns, .. } => {
                 subpatterns.iter().for_each(|field| field.pattern.walk_(it))
             }
             Or { pats } => pats.iter().for_each(|p| p.walk_(it)),
-            Array { box ref prefix, ref slice, box ref suffix }
-            | Slice { box ref prefix, ref slice, box ref suffix } => {
-                prefix.iter().chain(slice.iter()).chain(suffix.iter()).for_each(|p| p.walk_(it))
+            Array { box prefix, slice, box suffix } | Slice { box prefix, slice, box suffix } => {
+                prefix.iter().chain(slice.as_deref()).chain(suffix.iter()).for_each(|p| p.walk_(it))
             }
         }
     }
@@ -788,12 +826,17 @@ pub enum PatKind<'tcx> {
         value: mir::Const<'tcx>,
     },
 
-    /// Inline constant found while lowering a pattern.
-    InlineConstant {
-        /// [LocalDefId] of the constant, we need this so that we have a
+    /// Pattern obtained by converting a constant (inline or named) to its pattern
+    /// representation using `const_to_pat`.
+    ExpandedConstant {
+        /// [DefId] of the constant, we need this so that we have a
         /// reference that can be used by unsafety checking to visit nested
-        /// unevaluated constants.
-        def: LocalDefId,
+        /// unevaluated constants and for diagnostics. If the `DefId` doesn't
+        /// correspond to a local crate, it points at the `const` item.
+        def_id: DefId,
+        /// If `false`, then `def_id` points at a `const` item, otherwise it
+        /// corresponds to a local inline const.
+        is_inline: bool,
         /// If the inline constant is used in a range pattern, this subpattern
         /// represents the range (if both ends are inline constants, there will
         /// be multiple InlineConstant wrappers).
@@ -804,28 +847,28 @@ pub enum PatKind<'tcx> {
         subpattern: Box<Pat<'tcx>>,
     },
 
-    Range(Box<PatRange<'tcx>>),
+    Range(Arc<PatRange<'tcx>>),
 
     /// Matches against a slice, checking the length and extracting elements.
     /// irrefutable when there is a slice pattern and both `prefix` and `suffix` are empty.
     /// e.g., `&[ref xs @ ..]`.
     Slice {
-        prefix: Box<[Box<Pat<'tcx>>]>,
+        prefix: Box<[Pat<'tcx>]>,
         slice: Option<Box<Pat<'tcx>>>,
-        suffix: Box<[Box<Pat<'tcx>>]>,
+        suffix: Box<[Pat<'tcx>]>,
     },
 
     /// Fixed match against an array; irrefutable.
     Array {
-        prefix: Box<[Box<Pat<'tcx>>]>,
+        prefix: Box<[Pat<'tcx>]>,
         slice: Option<Box<Pat<'tcx>>>,
-        suffix: Box<[Box<Pat<'tcx>>]>,
+        suffix: Box<[Pat<'tcx>]>,
     },
 
     /// An or-pattern, e.g. `p | q`.
     /// Invariant: `pats.len() >= 2`.
     Or {
-        pats: Box<[Box<Pat<'tcx>>]>,
+        pats: Box<[Pat<'tcx>]>,
     },
 
     /// A never pattern `!`.
@@ -1087,7 +1130,7 @@ mod size_asserts {
     use super::*;
     // tidy-alphabetical-start
     static_assert_size!(Block, 48);
-    static_assert_size!(Expr<'_>, 64);
+    static_assert_size!(Expr<'_>, 72);
     static_assert_size!(ExprKind<'_>, 40);
     static_assert_size!(Pat<'_>, 64);
     static_assert_size!(PatKind<'_>, 48);

@@ -48,11 +48,8 @@ impl MachineStopType for ConstEvalErrKind {
             | ModifiedGlobal
             | WriteThroughImmutablePointer => {}
             AssertFailure(kind) => kind.add_args(adder),
-            Panic { msg, line, col, file } => {
-                adder("msg".into(), msg.into_diag_arg());
-                adder("file".into(), file.into_diag_arg());
-                adder("line".into(), line.into_diag_arg());
-                adder("col".into(), col.into_diag_arg());
+            Panic { msg, .. } => {
+                adder("msg".into(), msg.into_diag_arg(&mut None));
             }
         }
     }
@@ -72,7 +69,7 @@ pub fn get_span_and_frames<'tcx>(
     let mut stacktrace = Frame::generate_stacktrace_from_stack(stack);
     // Filter out `requires_caller_location` frames.
     stacktrace.retain(|frame| !frame.instance.def.requires_caller_location(*tcx));
-    let span = stacktrace.first().map(|f| f.span).unwrap_or(tcx.span);
+    let span = stacktrace.last().map(|f| f.span).unwrap_or(tcx.span);
 
     let mut frames = Vec::new();
 
@@ -115,6 +112,20 @@ pub fn get_span_and_frames<'tcx>(
         }
     }
 
+    // In `rustc`, we present const-eval errors from the outer-most place first to the inner-most.
+    // So we reverse the frames here. The first frame will be the same as the span from the current
+    // `TyCtxtAt<'_>`, so we remove it as it would be redundant.
+    frames.reverse();
+    if frames.len() > 0 {
+        frames.remove(0);
+    }
+    if let Some(last) = frames.last_mut()
+        // If the span is not going to be printed, we don't want the span label for `is_last`.
+        && tcx.sess.source_map().span_to_snippet(last.span.source_callsite()).is_ok()
+    {
+        last.has_label = true;
+    }
+
     (span, frames)
 }
 
@@ -139,12 +150,14 @@ where
     match error {
         // Don't emit a new diagnostic for these errors, they are already reported elsewhere or
         // should remain silent.
-        err_inval!(Layout(LayoutError::Unknown(_))) | err_inval!(TooGeneric) => {
+        err_inval!(AlreadyReported(info)) => ErrorHandled::Reported(info, span),
+        err_inval!(Layout(LayoutError::TooGeneric(_))) | err_inval!(TooGeneric) => {
             ErrorHandled::TooGeneric(span)
         }
-        err_inval!(AlreadyReported(guar)) => ErrorHandled::Reported(guar, span),
         err_inval!(Layout(LayoutError::ReferencesError(guar))) => {
-            ErrorHandled::Reported(ReportedErrorInfo::tainted_by_errors(guar), span)
+            // This can occur in infallible promoteds e.g. when a non-existent type or field is
+            // encountered.
+            ErrorHandled::Reported(ReportedErrorInfo::allowed_in_infallible(guar), span)
         }
         // Report remaining errors.
         _ => {
@@ -152,7 +165,12 @@ where
             let span = span.substitute_dummy(our_span);
             let err = mk(span, frames);
             let mut err = tcx.dcx().create_err(err);
-            let can_be_spurious = matches!(error, InterpErrorKind::ResourceExhaustion(_));
+            // We allow invalid programs in infallible promoteds since invalid layouts can occur
+            // anyway (e.g. due to size overflow). And we allow OOM as that can happen any time.
+            let allowed_in_infallible = matches!(
+                error,
+                InterpErrorKind::ResourceExhaustion(_) | InterpErrorKind::InvalidProgram(_)
+            );
 
             let msg = error.diagnostic_message();
             error.add_args(&mut err);
@@ -160,10 +178,10 @@ where
             // Use *our* span to label the interp error
             err.span_label(our_span, msg);
             let g = err.emit();
-            let reported = if can_be_spurious {
-                ReportedErrorInfo::spurious(g)
+            let reported = if allowed_in_infallible {
+                ReportedErrorInfo::allowed_in_infallible(g)
             } else {
-                ReportedErrorInfo::from(g)
+                ReportedErrorInfo::const_eval_error(g)
             };
             ErrorHandled::Reported(reported, span)
         }

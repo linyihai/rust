@@ -43,6 +43,8 @@ fn main() {
     {
         use std::os::raw::{c_int, c_void};
 
+        use tikv_jemalloc_sys as jemalloc_sys;
+
         #[used]
         static _F1: unsafe extern "C" fn(usize, usize) -> *mut c_void = jemalloc_sys::calloc;
         #[used]
@@ -63,7 +65,7 @@ fn main() {
         // linking, so we need to explicitly depend on the function.
         #[cfg(target_os = "macos")]
         {
-            extern "C" {
+            unsafe extern "C" {
                 fn _rjem_je_zone_register();
             }
 

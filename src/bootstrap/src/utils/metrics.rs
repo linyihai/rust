@@ -56,7 +56,7 @@ impl BuildMetrics {
             running_steps: Vec::new(),
 
             system_info: System::new_with_specifics(
-                RefreshKind::new().with_cpu(CpuRefreshKind::everything()),
+                RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
             ),
             timer_start: None,
             invocation_timer_start: Instant::now(),
@@ -161,8 +161,9 @@ impl BuildMetrics {
 
         let dest = build.out.join("metrics.json");
 
-        let mut system =
-            System::new_with_specifics(RefreshKind::new().with_cpu(CpuRefreshKind::everything()));
+        let mut system = System::new_with_specifics(
+            RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
+        );
         system.refresh_cpu_usage();
         system.refresh_memory();
 
@@ -199,6 +200,14 @@ impl BuildMetrics {
             }
         };
         invocations.push(JsonInvocation {
+            // The command-line invocation with which bootstrap was invoked.
+            // Skip the first argument, as it is a potentially long absolute
+            // path that is not interesting.
+            cmdline: std::env::args_os()
+                .skip(1)
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
             start_time: state
                 .invocation_start
                 .duration_since(SystemTime::UNIX_EPOCH)

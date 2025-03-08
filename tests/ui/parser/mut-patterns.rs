@@ -15,6 +15,10 @@ pub fn main() {
     //~^ ERROR `mut` on a binding may not be repeated
     //~| remove the additional `mut`s
 
+    let mut mut mut mut mut x = 0;
+    //~^ ERROR `mut` on a binding may not be repeated
+    //~| remove the additional `mut`s
+
     struct Foo { x: isize }
     let mut Foo { x: x } = Foo { x: 3 };
     //~^ ERROR `mut` must be attached to each individual binding
@@ -41,7 +45,7 @@ pub fn main() {
     // Make sure we don't accidentally allow `mut $p` where `$p:pat`.
     macro_rules! foo {
         ($p:pat) => {
-            let mut $p = 0; //~ ERROR expected identifier, found `x`
+            let mut $p = 0; //~ ERROR expected identifier, found metavariable
         }
     }
     foo!(x);

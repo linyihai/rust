@@ -52,24 +52,27 @@ impl<T: ?Sized> LegacyReceiver for &mut T {}
 impl<T: ?Sized, A: Allocator> LegacyReceiver for Box<T, A> {}
 
 #[lang = "copy"]
-pub unsafe trait Copy {}
+pub trait Copy {}
 
-unsafe impl Copy for bool {}
-unsafe impl Copy for u8 {}
-unsafe impl Copy for u16 {}
-unsafe impl Copy for u32 {}
-unsafe impl Copy for u64 {}
-unsafe impl Copy for usize {}
-unsafe impl Copy for i8 {}
-unsafe impl Copy for i16 {}
-unsafe impl Copy for i32 {}
-unsafe impl Copy for isize {}
-unsafe impl Copy for f32 {}
-unsafe impl Copy for f64 {}
-unsafe impl Copy for char {}
-unsafe impl<'a, T: ?Sized> Copy for &'a T {}
-unsafe impl<T: ?Sized> Copy for *const T {}
-unsafe impl<T: ?Sized> Copy for *mut T {}
+#[lang = "bikeshed_guaranteed_no_drop"]
+pub trait BikeshedGuaranteedNoDrop {}
+
+impl Copy for bool {}
+impl Copy for u8 {}
+impl Copy for u16 {}
+impl Copy for u32 {}
+impl Copy for u64 {}
+impl Copy for usize {}
+impl Copy for i8 {}
+impl Copy for i16 {}
+impl Copy for i32 {}
+impl Copy for isize {}
+impl Copy for f32 {}
+impl Copy for f64 {}
+impl Copy for char {}
+impl<'a, T: ?Sized> Copy for &'a T {}
+impl<T: ?Sized> Copy for *const T {}
+impl<T: ?Sized> Copy for *mut T {}
 
 #[lang = "sync"]
 pub unsafe trait Sync {}
@@ -163,6 +166,14 @@ impl Add for i8 {
 }
 
 impl Add for usize {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self {
+        self + rhs
+    }
+}
+
+impl Add for isize {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self {
@@ -580,70 +591,31 @@ pub union MaybeUninit<T> {
 
 pub mod intrinsics {
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub fn abort() -> ! {
-        loop {}
-    }
+    pub fn abort() -> !;
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub fn size_of<T>() -> usize {
-        loop {}
-    }
+    pub fn size_of<T>() -> usize;
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub unsafe fn size_of_val<T: ?::Sized>(_val: *const T) -> usize {
-        loop {}
-    }
+    pub unsafe fn size_of_val<T: ?::Sized>(_val: *const T) -> usize;
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub fn min_align_of<T>() -> usize {
-        loop {}
-    }
+    pub fn min_align_of<T>() -> usize;
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub unsafe fn min_align_of_val<T: ?::Sized>(_val: *const T) -> usize {
-        loop {}
-    }
+    pub unsafe fn min_align_of_val<T: ?::Sized>(_val: *const T) -> usize;
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub unsafe fn copy<T>(_src: *const T, _dst: *mut T, _count: usize) {
-        loop {}
-    }
+    pub unsafe fn copy<T>(_src: *const T, _dst: *mut T, _count: usize);
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub unsafe fn transmute<T, U>(_e: T) -> U {
-        loop {}
-    }
+    pub unsafe fn transmute<T, U>(_e: T) -> U;
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub unsafe fn ctlz_nonzero<T>(_x: T) -> u32 {
-        loop {}
-    }
+    pub unsafe fn ctlz_nonzero<T>(_x: T) -> u32;
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub fn needs_drop<T: ?::Sized>() -> bool {
-        loop {}
-    }
+    pub fn needs_drop<T: ?::Sized>() -> bool;
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub fn bitreverse<T>(_x: T) -> T {
-        loop {}
-    }
+    pub fn bitreverse<T>(_x: T) -> T;
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub fn bswap<T>(_x: T) -> T {
-        loop {}
-    }
+    pub fn bswap<T>(_x: T) -> T;
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub unsafe fn write_bytes<T>(_dst: *mut T, _val: u8, _count: usize) {
-        loop {}
-    }
+    pub unsafe fn write_bytes<T>(_dst: *mut T, _val: u8, _count: usize);
     #[rustc_intrinsic]
-    #[rustc_intrinsic_must_be_overridden]
-    pub unsafe fn unreachable() -> ! {
-        loop {}
-    }
+    pub unsafe fn unreachable() -> !;
 }
 
 pub mod libc {
@@ -681,7 +653,7 @@ impl<T> Index<usize> for [T] {
     }
 }
 
-extern {
+extern "C" {
     type VaListImpl;
 }
 

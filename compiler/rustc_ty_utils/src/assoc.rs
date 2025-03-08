@@ -1,12 +1,12 @@
 use rustc_data_structures::fx::FxIndexSet;
-use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, DefIdMap, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
+use rustc_hir::{self as hir, AmbigArg};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, ImplTraitInTraitData, TyCtxt};
 use rustc_middle::{bug, span_bug};
-use rustc_span::symbol::kw;
+use rustc_span::kw;
 
 pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers {
@@ -95,7 +95,7 @@ fn impl_item_implementor_ids(tcx: TyCtxt<'_>, impl_id: DefId) -> DefIdMap<DefId>
 
 fn associated_item(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::AssocItem {
     let id = tcx.local_def_id_to_hir_id(def_id);
-    let parent_def_id = tcx.hir().get_parent_item(id);
+    let parent_def_id = tcx.hir_get_parent_item(id);
     let parent_item = tcx.hir().expect_item(parent_def_id.def_id);
     match parent_item.kind {
         hir::ItemKind::Impl(impl_) => {
@@ -187,7 +187,7 @@ fn associated_types_for_impl_traits_in_associated_fn(
             }
 
             impl<'tcx> Visitor<'tcx> for RPITVisitor {
-                fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx>) {
+                fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx, AmbigArg>) {
                     if let hir::TyKind::OpaqueDef(opaq) = ty.kind
                         && self.rpits.insert(opaq.def_id)
                     {
@@ -252,7 +252,8 @@ fn associated_type_for_impl_trait_in_trait(
     assert_eq!(tcx.def_kind(trait_def_id), DefKind::Trait);
 
     let span = tcx.def_span(opaque_ty_def_id);
-    let trait_assoc_ty = tcx.at(span).create_def(trait_def_id, kw::Empty, DefKind::AssocTy);
+    // No name because this is a synthetic associated type.
+    let trait_assoc_ty = tcx.at(span).create_def(trait_def_id, None, DefKind::AssocTy);
 
     let local_def_id = trait_assoc_ty.def_id();
     let def_id = local_def_id.to_def_id();
@@ -304,7 +305,8 @@ fn associated_type_for_impl_trait_in_impl(
         hir::FnRetTy::DefaultReturn(_) => tcx.def_span(impl_fn_def_id),
         hir::FnRetTy::Return(ty) => ty.span,
     };
-    let impl_assoc_ty = tcx.at(span).create_def(impl_local_def_id, kw::Empty, DefKind::AssocTy);
+    // No name because this is a synthetic associated type.
+    let impl_assoc_ty = tcx.at(span).create_def(impl_local_def_id, None, DefKind::AssocTy);
 
     let local_def_id = impl_assoc_ty.def_id();
     let def_id = local_def_id.to_def_id();

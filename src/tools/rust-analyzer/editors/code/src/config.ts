@@ -13,6 +13,8 @@ export type RunnableEnvCfgItem = {
 };
 export type RunnableEnvCfg = Record<string, string> | RunnableEnvCfgItem[];
 
+type ShowStatusBar = "always" | "never" | { documentSelector: vscode.DocumentSelector };
+
 export class Config {
     readonly extensionId = "rust-lang.rust-analyzer";
     configureLang: vscode.Disposable | undefined;
@@ -138,13 +140,13 @@ export class Config {
                 {
                     // Parent doc single-line comment
                     // e.g. //!|
-                    beforeText: /^\s*\/{2}\!.*$/,
+                    beforeText: /^\s*\/{2}!.*$/,
                     action: { indentAction, appendText: "//! " },
                 },
                 {
                     // Begins an auto-closed multi-line comment (standard or parent doc)
                     // e.g. /** | */ or /*! | */
-                    beforeText: /^\s*\/\*(\*|\!)(?!\/)([^\*]|\*(?!\/))*$/,
+                    beforeText: /^\s*\/\*(\*|!)(?!\/)([^*]|\*(?!\/))*$/,
                     afterText: /^\s*\*\/$/,
                     action: {
                         indentAction: vscode.IndentAction.IndentOutdent,
@@ -154,19 +156,19 @@ export class Config {
                 {
                     // Begins a multi-line comment (standard or parent doc)
                     // e.g. /** ...| or /*! ...|
-                    beforeText: /^\s*\/\*(\*|\!)(?!\/)([^\*]|\*(?!\/))*$/,
+                    beforeText: /^\s*\/\*(\*|!)(?!\/)([^*]|\*(?!\/))*$/,
                     action: { indentAction, appendText: " * " },
                 },
                 {
                     // Continues a multi-line comment
                     // e.g.  * ...|
-                    beforeText: /^(\ \ )*\ \*(\ ([^\*]|\*(?!\/))*)?$/,
+                    beforeText: /^( {2})* \*( ([^*]|\*(?!\/))*)?$/,
                     action: { indentAction, appendText: "* " },
                 },
                 {
                     // Dedents after closing a multi-line comment
                     // e.g.  */|
-                    beforeText: /^(\ \ )*\ \*\/\s*$/,
+                    beforeText: /^( {2})* \*\/\s*$/,
                     action: { indentAction, removeText: 1 },
                 },
             ];
@@ -220,9 +222,11 @@ export class Config {
             ),
         );
     }
+
     get checkOnSave() {
         return this.get<boolean>("checkOnSave") ?? false;
     }
+
     async toggleCheckOnSave() {
         const config = this.cfg.inspect<boolean>("checkOnSave") ?? { key: "checkOnSave" };
         let overrideInLanguage;
@@ -261,9 +265,11 @@ export class Config {
         return this.get<boolean | undefined>("testExplorer");
     }
 
-    get runnablesExtraEnv() {
+    runnablesExtraEnv(label: string): Record<string, string> | undefined {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const item = this.get<any>("runnables.extraEnv") ?? this.get<any>("runnableEnv");
-        if (!item) return item;
+        if (!item) return undefined;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const fixRecord = (r: Record<string, any>) => {
             for (const key in r) {
                 if (typeof r[key] !== "string") {
@@ -271,11 +277,28 @@ export class Config {
                 }
             }
         };
+
+        const platform = process.platform;
+        const checkPlatform = (it: RunnableEnvCfgItem) => {
+            if (it.platform) {
+                const platforms = Array.isArray(it.platform) ? it.platform : [it.platform];
+                return platforms.indexOf(platform) >= 0;
+            }
+            return true;
+        };
+
         if (item instanceof Array) {
-            item.forEach((x) => fixRecord(x.env));
-        } else {
-            fixRecord(item);
+            const env = {};
+            for (const it of item) {
+                const masked = !it.mask || new RegExp(it.mask).test(label);
+                if (masked && checkPlatform(it)) {
+                    Object.assign(env, it.env);
+                }
+            }
+            fixRecord(env);
+            return env;
         }
+        fixRecord(item);
         return item;
     }
 
@@ -315,6 +338,7 @@ export class Config {
             gotoTypeDef: this.get<boolean>("hover.actions.gotoTypeDef.enable"),
         };
     }
+
     get previewRustcOutput() {
         return this.get<boolean>("diagnostics.previewRustcOutput");
     }
@@ -327,23 +351,41 @@ export class Config {
         return this.get<boolean>("showDependenciesExplorer");
     }
 
+    get showSyntaxTree() {
+        return this.get<boolean>("showSyntaxTree");
+    }
+
     get statusBarClickAction() {
         return this.get<string>("statusBar.clickAction");
     }
 
+    get statusBarShowStatusBar() {
+        return this.get<ShowStatusBar>("statusBar.showStatusBar");
+    }
+
     get initializeStopped() {
         return this.get<boolean>("initializeStopped");
+    }
+
+    get askBeforeUpdateTest() {
+        return this.get<boolean>("runnables.askBeforeUpdateTest");
+    }
+
+    async setAskBeforeUpdateTest(value: boolean) {
+        await this.cfg.update("runnables.askBeforeUpdateTest", value, true);
     }
 }
 
 export function prepareVSCodeConfig<T>(resp: T): T {
     if (Is.string(resp)) {
         return substituteVSCodeVariableInString(resp) as T;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } else if (resp && Is.array<any>(resp)) {
         return resp.map((val) => {
             return prepareVSCodeConfig(val);
         }) as T;
     } else if (resp && typeof resp === "object") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const res: { [key: string]: any } = {};
         for (const key in resp) {
             const val = resp[key];
@@ -450,8 +492,7 @@ function computeVscodeVar(varName: string): string | null {
         // TODO: support for remote workspaces?
         const fsPath: string =
             folder === undefined
-                ? // no workspace opened
-                  ""
+                ? "" // no workspace opened
                 : // could use currently opened document to detect the correct
                   // workspace. However, that would be determined by the document
                   // user has opened on Editor startup. Could lead to

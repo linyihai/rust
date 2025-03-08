@@ -3,7 +3,6 @@
 //! configs (autodiff enabled or disabled), so we have to add cfg's to each import.
 //! FIXME(ZuseZ4): Remove this once we have a smarter linter.
 
-#[cfg(llvm_enzyme)]
 mod llvm_enzyme {
     use std::str::FromStr;
     use std::string::String;
@@ -20,8 +19,7 @@ mod llvm_enzyme {
         PatKind, TyKind,
     };
     use rustc_expand::base::{Annotatable, ExtCtxt};
-    use rustc_span::symbol::{Ident, kw, sym};
-    use rustc_span::{Span, Symbol};
+    use rustc_span::{Ident, Span, Symbol, kw, sym};
     use thin_vec::{ThinVec, thin_vec};
     use tracing::{debug, trace};
 
@@ -35,7 +33,7 @@ mod llvm_enzyme {
             FnRetTy::Default(_) => false,
         }
     }
-    fn first_ident(x: &MetaItemInner) -> rustc_span::symbol::Ident {
+    fn first_ident(x: &MetaItemInner) -> rustc_span::Ident {
         let segments = &x.meta_item().unwrap().path.segments;
         assert!(segments.len() == 1);
         segments[0].ident
@@ -131,10 +129,14 @@ mod llvm_enzyme {
         meta_item: &ast::MetaItem,
         mut item: Annotatable,
     ) -> Vec<Annotatable> {
+        if cfg!(not(llvm_enzyme)) {
+            ecx.sess.dcx().emit_err(errors::AutoDiffSupportNotBuild { span: meta_item.span });
+            return vec![item];
+        }
         let dcx = ecx.sess.dcx();
         // first get the annotable item:
         let (sig, is_impl): (FnSig, bool) = match &item {
-            Annotatable::Item(ref iitem) => {
+            Annotatable::Item(iitem) => {
                 let sig = match &iitem.kind {
                     ItemKind::Fn(box ast::Fn { sig, .. }) => sig,
                     _ => {
@@ -144,7 +146,7 @@ mod llvm_enzyme {
                 };
                 (sig.clone(), false)
             }
-            Annotatable::AssocItem(ref assoc_item, _) => {
+            Annotatable::AssocItem(assoc_item, _) => {
                 let sig = match &assoc_item.kind {
                     ast::AssocItemKind::Fn(box ast::Fn { sig, .. }) => sig,
                     _ => {
@@ -172,8 +174,8 @@ mod llvm_enzyme {
         let sig_span = ecx.with_call_site_ctxt(sig.span);
 
         let (vis, primal) = match &item {
-            Annotatable::Item(ref iitem) => (iitem.vis.clone(), iitem.ident.clone()),
-            Annotatable::AssocItem(ref assoc_item, _) => {
+            Annotatable::Item(iitem) => (iitem.vis.clone(), iitem.ident.clone()),
+            Annotatable::AssocItem(assoc_item, _) => {
                 (assoc_item.vis.clone(), assoc_item.ident.clone())
             }
             _ => {
@@ -243,6 +245,7 @@ mod llvm_enzyme {
             defaultness: ast::Defaultness::Final,
             sig: d_sig,
             generics: Generics::default(),
+            contract: None,
             body: Some(d_body),
         });
         let mut rustc_ad_attr =
@@ -283,7 +286,7 @@ mod llvm_enzyme {
         let orig_annotatable: Annotatable = match item {
             Annotatable::Item(ref mut iitem) => {
                 if !iitem.attrs.iter().any(|a| a.id == attr.id) {
-                    iitem.attrs.push(attr.clone());
+                    iitem.attrs.push(attr);
                 }
                 if !iitem.attrs.iter().any(|a| a.id == inline_never.id) {
                     iitem.attrs.push(inline_never.clone());
@@ -292,7 +295,7 @@ mod llvm_enzyme {
             }
             Annotatable::AssocItem(ref mut assoc_item, i @ Impl) => {
                 if !assoc_item.attrs.iter().any(|a| a.id == attr.id) {
-                    assoc_item.attrs.push(attr.clone());
+                    assoc_item.attrs.push(attr);
                 }
                 if !assoc_item.attrs.iter().any(|a| a.id == inline_never.id) {
                     assoc_item.attrs.push(inline_never.clone());
@@ -319,7 +322,7 @@ mod llvm_enzyme {
         let d_annotatable = if is_impl {
             let assoc_item: AssocItemKind = ast::AssocItemKind::Fn(asdf);
             let d_fn = P(ast::AssocItem {
-                attrs: thin_vec![d_attr.clone(), inline_never],
+                attrs: thin_vec![d_attr, inline_never],
                 id: ast::DUMMY_NODE_ID,
                 span,
                 vis,
@@ -329,12 +332,8 @@ mod llvm_enzyme {
             });
             Annotatable::AssocItem(d_fn, Impl)
         } else {
-            let mut d_fn = ecx.item(
-                span,
-                d_ident,
-                thin_vec![d_attr.clone(), inline_never],
-                ItemKind::Fn(asdf),
-            );
+            let mut d_fn =
+                ecx.item(span, d_ident, thin_vec![d_attr, inline_never], ItemKind::Fn(asdf));
             d_fn.vis = vis;
             Annotatable::Item(d_fn)
         };
@@ -407,19 +406,21 @@ mod llvm_enzyme {
         let unsf_expr = ecx.expr_block(P(unsf_block));
         let blackbox_call_expr = ecx.expr_path(ecx.path(span, blackbox_path));
         let primal_call = gen_primal_call(ecx, span, primal, idents);
-        let black_box_primal_call =
-            ecx.expr_call(new_decl_span, blackbox_call_expr.clone(), thin_vec![
-                primal_call.clone()
-            ]);
+        let black_box_primal_call = ecx.expr_call(
+            new_decl_span,
+            blackbox_call_expr.clone(),
+            thin_vec![primal_call.clone()],
+        );
         let tup_args = new_names
             .iter()
             .map(|arg| ecx.expr_path(ecx.path_ident(span, Ident::from_str(arg))))
             .collect();
 
-        let black_box_remaining_args =
-            ecx.expr_call(sig_span, blackbox_call_expr.clone(), thin_vec![
-                ecx.expr_tuple(sig_span, tup_args)
-            ]);
+        let black_box_remaining_args = ecx.expr_call(
+            sig_span,
+            blackbox_call_expr.clone(),
+            thin_vec![ecx.expr_tuple(sig_span, tup_args)],
+        );
 
         let mut body = ecx.block(span, ThinVec::new());
         body.stmts.push(ecx.stmt_semi(unsf_expr));
@@ -441,7 +442,7 @@ mod llvm_enzyme {
 
         if primal_ret && n_active == 0 && x.mode.is_rev() {
             // We only have the primal ret.
-            body.stmts.push(ecx.stmt_expr(black_box_primal_call.clone()));
+            body.stmts.push(ecx.stmt_expr(black_box_primal_call));
             return body;
         }
 
@@ -466,7 +467,7 @@ mod llvm_enzyme {
         if primal_ret {
             // We have both primal ret and active floats.
             // primal ret is first, by construction.
-            exprs.push(primal_call.clone());
+            exprs.push(primal_call);
         }
 
         // Now construct default placeholder for each active float.
@@ -533,13 +534,11 @@ mod llvm_enzyme {
                 return body;
             }
             [arg] => {
-                ret = ecx
-                    .expr_call(new_decl_span, blackbox_call_expr.clone(), thin_vec![arg.clone()]);
+                ret = ecx.expr_call(new_decl_span, blackbox_call_expr, thin_vec![arg.clone()]);
             }
             args => {
                 let ret_tuple: P<ast::Expr> = ecx.expr_tuple(span, args.into());
-                ret =
-                    ecx.expr_call(new_decl_span, blackbox_call_expr.clone(), thin_vec![ret_tuple]);
+                ret = ecx.expr_call(new_decl_span, blackbox_call_expr, thin_vec![ret_tuple]);
             }
         }
         assert!(has_ret(&d_sig.decl.output));
@@ -559,7 +558,7 @@ mod llvm_enzyme {
             let args: ThinVec<_> =
                 idents[1..].iter().map(|arg| ecx.expr_path(ecx.path_ident(span, *arg))).collect();
             let self_expr = ecx.expr_self(span);
-            ecx.expr_method_call(span, self_expr, primal, args.clone())
+            ecx.expr_method_call(span, self_expr, primal, args)
         } else {
             let args: ThinVec<_> =
                 idents.iter().map(|arg| ecx.expr_path(ecx.path_ident(span, *arg))).collect();
@@ -796,25 +795,4 @@ mod llvm_enzyme {
     }
 }
 
-#[cfg(not(llvm_enzyme))]
-mod ad_fallback {
-    use rustc_ast::ast;
-    use rustc_expand::base::{Annotatable, ExtCtxt};
-    use rustc_span::Span;
-
-    use crate::errors;
-    pub(crate) fn expand(
-        ecx: &mut ExtCtxt<'_>,
-        _expand_span: Span,
-        meta_item: &ast::MetaItem,
-        item: Annotatable,
-    ) -> Vec<Annotatable> {
-        ecx.sess.dcx().emit_err(errors::AutoDiffSupportNotBuild { span: meta_item.span });
-        return vec![item];
-    }
-}
-
-#[cfg(not(llvm_enzyme))]
-pub(crate) use ad_fallback::expand;
-#[cfg(llvm_enzyme)]
 pub(crate) use llvm_enzyme::expand;

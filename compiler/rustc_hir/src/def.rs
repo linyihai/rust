@@ -9,7 +9,6 @@ use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_span::Symbol;
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::hygiene::MacroKind;
-use rustc_span::symbol::kw;
 
 use crate::definitions::DefPathData;
 use crate::hir;
@@ -109,7 +108,16 @@ pub enum DefKind {
     Use,
     /// An `extern` block.
     ForeignMod,
-    /// Anonymous constant, e.g. the `1 + 2` in `[u8; 1 + 2]`
+    /// Anonymous constant, e.g. the `1 + 2` in `[u8; 1 + 2]`.
+    ///
+    /// Not all anon-consts are actually still relevant in the HIR. We lower
+    /// trivial const-arguments directly to `hir::ConstArgKind::Path`, at which
+    /// point the definition for the anon-const ends up unused and incomplete.
+    ///
+    /// We do not provide any a `Span` for the definition and pretty much all other
+    /// queries also ICE when using this `DefId`. Given that the `DefId` of such
+    /// constants should only be reachable by iterating all definitions of a
+    /// given crate, you should not have to worry about this.
     AnonConst,
     /// An inline constant, e.g. `const { 1 + 2 }`
     InlineConst,
@@ -245,9 +253,10 @@ impl DefKind {
         }
     }
 
-    pub fn def_path_data(self, name: Symbol) -> DefPathData {
+    // Some `DefKind`s require a name, some don't. Panics if one is needed but
+    // not provided. (`AssocTy` is an exception, see below.)
+    pub fn def_path_data(self, name: Option<Symbol>) -> DefPathData {
         match self {
-            DefKind::Struct | DefKind::Union if name == kw::Empty => DefPathData::AnonAdt,
             DefKind::Mod
             | DefKind::Struct
             | DefKind::Union
@@ -257,9 +266,13 @@ impl DefKind {
             | DefKind::TyAlias
             | DefKind::ForeignTy
             | DefKind::TraitAlias
-            | DefKind::AssocTy
             | DefKind::TyParam
-            | DefKind::ExternCrate => DefPathData::TypeNs(name),
+            | DefKind::ExternCrate => DefPathData::TypeNs(Some(name.unwrap())),
+
+            // An associated type names will be missing for an RPITIT. It will
+            // later be given a name with `synthetic` in it, if necessary.
+            DefKind::AssocTy => DefPathData::TypeNs(name),
+
             // It's not exactly an anon const, but wrt DefPathData, there
             // is no difference.
             DefKind::Static { nested: true, .. } => DefPathData::AnonConst,
@@ -269,9 +282,9 @@ impl DefKind {
             | DefKind::Static { .. }
             | DefKind::AssocFn
             | DefKind::AssocConst
-            | DefKind::Field => DefPathData::ValueNs(name),
-            DefKind::Macro(..) => DefPathData::MacroNs(name),
-            DefKind::LifetimeParam => DefPathData::LifetimeNs(name),
+            | DefKind::Field => DefPathData::ValueNs(name.unwrap()),
+            DefKind::Macro(..) => DefPathData::MacroNs(name.unwrap()),
+            DefKind::LifetimeParam => DefPathData::LifetimeNs(name.unwrap()),
             DefKind::Ctor(..) => DefPathData::Ctor,
             DefKind::Use => DefPathData::Use,
             DefKind::ForeignMod => DefPathData::ForeignMod,
@@ -787,7 +800,7 @@ impl<Id> Res<Id> {
 
     /// Always returns `true` if `self` is `Res::Err`
     pub fn matches_ns(&self, ns: Namespace) -> bool {
-        self.ns().map_or(true, |actual_ns| actual_ns == ns)
+        self.ns().is_none_or(|actual_ns| actual_ns == ns)
     }
 
     /// Returns whether such a resolved path can occur in a tuple struct/variant pattern

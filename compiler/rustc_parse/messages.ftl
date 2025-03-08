@@ -26,6 +26,11 @@ parse_async_move_block_in_2015 = `async move` blocks are only allowed in Rust 20
 parse_async_move_order_incorrect = the order of `move` and `async` is incorrect
     .suggestion = try switching the order
 
+parse_async_use_block_in_2015 = `async use` blocks are only allowed in Rust 2018 or later
+
+parse_async_use_order_incorrect = the order of `use` and `async` is incorrect
+    .suggestion = try switching the order
+
 parse_at_dot_dot_in_struct_pattern = `@ ..` is not supported in struct patterns
     .suggestion = bind to each field separately or, if you don't need them, just remove `{$ident} @`
 
@@ -169,9 +174,6 @@ parse_enum_struct_mutually_exclusive = `enum` and `struct` are mutually exclusiv
 parse_eq_field_init = expected `:`, found `=`
     .suggestion = replace equals symbol with a colon
 
-parse_equals_struct_default = default values on `struct` fields aren't supported
-    .suggestion = remove this unsupported default value
-
 parse_escape_only_char = {$byte ->
     [true] byte
     *[false] character
@@ -216,6 +218,9 @@ parse_expected_identifier_found_doc_comment = expected identifier, found doc com
 parse_expected_identifier_found_doc_comment_str = expected identifier, found doc comment `{$token}`
 parse_expected_identifier_found_keyword = expected identifier, found keyword
 parse_expected_identifier_found_keyword_str = expected identifier, found keyword `{$token}`
+parse_expected_identifier_found_metavar = expected identifier, found metavariable
+# This one deliberately doesn't print a token.
+parse_expected_identifier_found_metavar_str = expected identifier, found metavariable
 parse_expected_identifier_found_reserved_identifier = expected identifier, found reserved identifier
 parse_expected_identifier_found_reserved_identifier_str = expected identifier, found reserved identifier `{$token}`
 parse_expected_identifier_found_reserved_keyword = expected identifier, found reserved keyword
@@ -227,6 +232,8 @@ parse_expected_mut_or_const_in_raw_pointer_type = expected `mut` or `const` keyw
 
 parse_expected_semi_found_doc_comment_str = expected `;`, found doc comment `{$token}`
 parse_expected_semi_found_keyword_str = expected `;`, found keyword `{$token}`
+# This one deliberately doesn't print a token.
+parse_expected_semi_found_metavar_str = expected `;`, found metavariable
 parse_expected_semi_found_reserved_identifier_str = expected `;`, found reserved identifier `{$token}`
 parse_expected_semi_found_reserved_keyword_str = expected `;`, found reserved keyword `{$token}`
 parse_expected_semi_found_str = expected `;`, found `{$token}`
@@ -338,10 +345,16 @@ parse_incorrect_semicolon =
     .suggestion = remove this semicolon
     .help = {$name} declarations are not followed by a semicolon
 
+parse_incorrect_type_on_self = type not allowed for shorthand `self` parameter
+    .suggestion = move the modifiers on `self` to the type
+
 parse_incorrect_use_of_await = incorrect use of `await`
     .parentheses_suggestion = `await` is not a method call, remove the parentheses
 
 parse_incorrect_use_of_await_postfix_suggestion = `await` is a postfix operation
+
+parse_incorrect_use_of_use = incorrect use of `use`
+    .parentheses_suggestion = `use` is not a method call, try removing the parentheses
 
 parse_incorrect_visibility_restriction = incorrect visibility restriction
     .help = some possible visibility restrictions are:
@@ -419,7 +432,7 @@ parse_invalid_logical_operator = `{$incorrect}` is not a logical operator
     .use_amp_amp_for_conjunction = use `&&` to perform logical conjunction
     .use_pipe_pipe_for_disjunction = use `||` to perform logical disjunction
 
-parse_invalid_meta_item = expected unsuffixed literal, found `{$token}`
+parse_invalid_meta_item = expected unsuffixed literal, found {$descr}
     .quote_ident_sugg = surround the identifier with quotation marks to make it into a string literal
 
 parse_invalid_offset_of = offset_of expects dot-separated field and variant names
@@ -711,6 +724,10 @@ parse_require_colon_after_labeled_expression = labeled expression must be follow
     .label = the label
     .suggestion = add `:` after the label
 
+parse_reserved_multihash = reserved multi-hash token is forbidden
+    .note = sequences of two or more # are reserved for future use since Rust 2024
+    .suggestion_whitespace = consider inserting whitespace here
+
 parse_reserved_string = invalid string literal
     .note = unprefixed guarded string literals are reserved for future use since Rust 2024
     .suggestion_whitespace = consider inserting whitespace here
@@ -733,9 +750,6 @@ parse_shift_interpreted_as_generic =
 parse_single_colon_import_path = expected `::`, found `:`
     .suggestion = use double colon
     .note = import paths are delimited using `::`
-
-parse_single_colon_struct_type = found single colon in a struct field type path
-    .suggestion = write a path separator here
 
 parse_static_with_generics = static items may not have generic parameters
 
@@ -822,7 +836,7 @@ parse_unexpected_expr_in_pat =
     }, found an expression
 
     .label = not a pattern
-    .note = arbitrary expressions are not allowed in patterns: <https://doc.rust-lang.org/book/ch18-00-patterns.html>
+    .note = arbitrary expressions are not allowed in patterns: <https://doc.rust-lang.org/book/ch19-00-patterns.html>
 
 parse_unexpected_expr_in_pat_const_sugg = consider extracting the expression into a `const`
 
@@ -864,6 +878,8 @@ parse_unexpected_token_after_not_logical = use `!` to perform logical negation
 parse_unexpected_token_after_struct_name = expected `where`, `{"{"}`, `(`, or `;` after struct name
 parse_unexpected_token_after_struct_name_found_doc_comment = expected `where`, `{"{"}`, `(`, or `;` after struct name, found doc comment `{$token}`
 parse_unexpected_token_after_struct_name_found_keyword = expected `where`, `{"{"}`, `(`, or `;` after struct name, found keyword `{$token}`
+# This one deliberately doesn't print a token.
+parse_unexpected_token_after_struct_name_found_metavar = expected `where`, `{"{"}`, `(`, or `;` after struct name, found metavar
 parse_unexpected_token_after_struct_name_found_other = expected `where`, `{"{"}`, `(`, or `;` after struct name, found `{$token}`
 
 parse_unexpected_token_after_struct_name_found_reserved_identifier = expected `where`, `{"{"}`, `(`, or `;` after struct name, found reserved identifier `{$token}`

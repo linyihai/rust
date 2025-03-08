@@ -1,9 +1,10 @@
-use super::api::{self, WinError};
+use super::api::{self, WinError, set_file_information_by_handle};
 use super::{IoResult, to_u16s};
+use crate::alloc::{Layout, alloc, dealloc};
 use crate::borrow::Cow;
 use crate::ffi::{OsStr, OsString, c_void};
 use crate::io::{self, BorrowedCursor, Error, IoSlice, IoSliceMut, SeekFrom};
-use crate::mem::{self, MaybeUninit};
+use crate::mem::{self, MaybeUninit, offset_of};
 use crate::os::windows::io::{AsHandle, BorrowedHandle};
 use crate::os::windows::prelude::*;
 use crate::path::{Path, PathBuf};
@@ -43,7 +44,7 @@ pub struct FileType {
 }
 
 pub struct ReadDir {
-    handle: FindNextFileHandle,
+    handle: Option<FindNextFileHandle>,
     root: Arc<PathBuf>,
     first: Option<c::WIN32_FIND_DATAW>,
 }
@@ -112,13 +113,13 @@ impl fmt::Debug for ReadDir {
 impl Iterator for ReadDir {
     type Item = io::Result<DirEntry>;
     fn next(&mut self) -> Option<io::Result<DirEntry>> {
-        if self.handle.0 == c::INVALID_HANDLE_VALUE {
+        let Some(handle) = self.handle.as_ref() else {
             // This iterator was initialized with an `INVALID_HANDLE_VALUE` as its handle.
             // Simply return `None` because this is only the case when `FindFirstFileExW` in
             // the construction of this iterator returns `ERROR_FILE_NOT_FOUND` which means
             // no matchhing files can be found.
             return None;
-        }
+        };
         if let Some(first) = self.first.take() {
             if let Some(e) = DirEntry::new(&self.root, &first) {
                 return Some(Ok(e));
@@ -127,7 +128,7 @@ impl Iterator for ReadDir {
         unsafe {
             let mut wfd = mem::zeroed();
             loop {
-                if c::FindNextFileW(self.handle.0, &mut wfd) == 0 {
+                if c::FindNextFileW(handle.0, &mut wfd) == 0 {
                     match api::get_last_error() {
                         WinError::NO_MORE_FILES => return None,
                         WinError { code } => {
@@ -295,6 +296,10 @@ impl OpenOptions {
 impl File {
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
         let path = maybe_verbatim(path)?;
+        Self::open_native(&path, opts)
+    }
+
+    fn open_native(path: &[u16], opts: &OpenOptions) -> io::Result<File> {
         let creation = opts.get_creation_mode()?;
         let handle = unsafe {
             c::CreateFileW(
@@ -314,22 +319,17 @@ impl File {
                 && creation == c::OPEN_ALWAYS
                 && api::get_last_error() == WinError::ALREADY_EXISTS
             {
-                unsafe {
-                    // This originally used `FileAllocationInfo` instead of
-                    // `FileEndOfFileInfo` but that wasn't supported by WINE.
-                    // It's arguable which fits the semantics of `OpenOptions`
-                    // better so let's just use the more widely supported method.
-                    let eof = c::FILE_END_OF_FILE_INFO { EndOfFile: 0 };
-                    let result = c::SetFileInformationByHandle(
-                        handle.as_raw_handle(),
-                        c::FileEndOfFileInfo,
-                        (&raw const eof).cast::<c_void>(),
-                        mem::size_of::<c::FILE_END_OF_FILE_INFO>() as u32,
-                    );
-                    if result == 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
+                // This first tries `FileAllocationInfo` but falls back to
+                // `FileEndOfFileInfo` in order to support WINE.
+                // If WINE gains support for FileAllocationInfo, we should
+                // remove the fallback.
+                let alloc = c::FILE_ALLOCATION_INFO { AllocationSize: 0 };
+                set_file_information_by_handle(handle.as_raw_handle(), &alloc)
+                    .or_else(|_| {
+                        let eof = c::FILE_END_OF_FILE_INFO { EndOfFile: 0 };
+                        set_file_information_by_handle(handle.as_raw_handle(), &eof)
+                    })
+                    .io_result()?;
             }
             Ok(File { handle: Handle::from_inner(handle) })
         } else {
@@ -477,7 +477,7 @@ impl File {
                     self.handle.as_raw_handle(),
                     c::FileAttributeTagInfo,
                     (&raw mut attr_tag).cast(),
-                    mem::size_of::<c::FILE_ATTRIBUTE_TAG_INFO>().try_into().unwrap(),
+                    size_of::<c::FILE_ATTRIBUTE_TAG_INFO>().try_into().unwrap(),
                 ))?;
                 if attr_tag.FileAttributes & c::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                     reparse_tag = attr_tag.ReparseTag;
@@ -504,7 +504,7 @@ impl File {
     pub fn file_attr(&self) -> io::Result<FileAttr> {
         unsafe {
             let mut info: c::FILE_BASIC_INFO = mem::zeroed();
-            let size = mem::size_of_val(&info);
+            let size = size_of_val(&info);
             cvt(c::GetFileInformationByHandleEx(
                 self.handle.as_raw_handle(),
                 c::FileBasicInfo,
@@ -536,7 +536,7 @@ impl File {
                 file_index: None,
             };
             let mut info: c::FILE_STANDARD_INFO = mem::zeroed();
-            let size = mem::size_of_val(&info);
+            let size = size_of_val(&info);
             cvt(c::GetFileInformationByHandleEx(
                 self.handle.as_raw_handle(),
                 c::FileStandardInfo,
@@ -551,7 +551,7 @@ impl File {
                     self.handle.as_raw_handle(),
                     c::FileAttributeTagInfo,
                     (&raw mut attr_tag).cast(),
-                    mem::size_of::<c::FILE_ATTRIBUTE_TAG_INFO>().try_into().unwrap(),
+                    size_of::<c::FILE_ATTRIBUTE_TAG_INFO>().try_into().unwrap(),
                 ))?;
                 if attr_tag.FileAttributes & c::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                     attr.reparse_tag = attr_tag.ReparseTag;
@@ -617,6 +617,10 @@ impl File {
         Ok(newpos as u64)
     }
 
+    pub fn tell(&self) -> io::Result<u64> {
+        self.seek(SeekFrom::Current(0))
+    }
+
     pub fn duplicate(&self) -> io::Result<File> {
         Ok(Self { handle: self.handle.try_clone()? })
     }
@@ -645,7 +649,7 @@ impl File {
                     ptr::null_mut(),
                 )
             })?;
-            const _: () = assert!(core::mem::align_of::<c::REPARSE_DATA_BUFFER>() <= 8);
+            const _: () = assert!(align_of::<c::REPARSE_DATA_BUFFER>() <= 8);
             Ok((bytes, space.0.as_mut_ptr().cast::<c::REPARSE_DATA_BUFFER>()))
         }
     }
@@ -677,7 +681,7 @@ impl File {
                     )
                 }
                 _ => {
-                    return Err(io::const_io_error!(
+                    return Err(io::const_error!(
                         io::ErrorKind::Uncategorized,
                         "Unsupported reparse point type",
                     ));
@@ -718,9 +722,9 @@ impl File {
             || times.modified.map_or(false, is_zero)
             || times.created.map_or(false, is_zero)
         {
-            return Err(io::const_io_error!(
+            return Err(io::const_error!(
                 io::ErrorKind::InvalidInput,
-                "Cannot set file timestamp to 0",
+                "cannot set file timestamp to 0",
             ));
         }
         let is_max = |t: c::FILETIME| t.dwLowDateTime == u32::MAX && t.dwHighDateTime == u32::MAX;
@@ -728,9 +732,9 @@ impl File {
             || times.modified.map_or(false, is_max)
             || times.created.map_or(false, is_max)
         {
-            return Err(io::const_io_error!(
+            return Err(io::const_error!(
                 io::ErrorKind::InvalidInput,
-                "Cannot set file timestamp to 0xFFFF_FFFF_FFFF_FFFF",
+                "cannot set file timestamp to 0xFFFF_FFFF_FFFF_FFFF",
             ));
         }
         cvt(unsafe {
@@ -749,7 +753,7 @@ impl File {
     fn basic_info(&self) -> io::Result<c::FILE_BASIC_INFO> {
         unsafe {
             let mut info: c::FILE_BASIC_INFO = mem::zeroed();
-            let size = mem::size_of_val(&info);
+            let size = size_of_val(&info);
             cvt(c::GetFileInformationByHandleEx(
                 self.handle.as_raw_handle(),
                 c::FileBasicInfo,
@@ -798,7 +802,7 @@ impl File {
     /// will prevent anyone from opening a new handle to the file.
     #[allow(unused)]
     fn win32_delete(&self) -> Result<(), WinError> {
-        let info = c::FILE_DISPOSITION_INFO { DeleteFile: c::TRUE as _ };
+        let info = c::FILE_DISPOSITION_INFO { DeleteFile: true };
         api::set_file_information_by_handle(self.handle.as_raw_handle(), &info)
     }
 
@@ -882,7 +886,6 @@ impl<'a> DirBuffIter<'a> {
 impl<'a> Iterator for DirBuffIter<'a> {
     type Item = (Cow<'a, [u16]>, bool);
     fn next(&mut self) -> Option<Self::Item> {
-        use crate::mem::size_of;
         let buffer = &self.buffer?[self.cursor..];
 
         // Get the name and next entry from the buffer.
@@ -1180,7 +1183,7 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
 
         if find_handle != c::INVALID_HANDLE_VALUE {
             Ok(ReadDir {
-                handle: FindNextFileHandle(find_handle),
+                handle: Some(FindNextFileHandle(find_handle)),
                 root: Arc::new(root),
                 first: Some(wfd),
             })
@@ -1198,11 +1201,7 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
             // See issue #120040: https://github.com/rust-lang/rust/issues/120040.
             let last_error = api::get_last_error();
             if last_error == WinError::FILE_NOT_FOUND {
-                return Ok(ReadDir {
-                    handle: FindNextFileHandle(find_handle),
-                    root: Arc::new(root),
-                    first: None,
-                });
+                return Ok(ReadDir { handle: None, root: Arc::new(root), first: None });
             }
 
             // Just return the error constructed from the raw OS error if the above is not the case.
@@ -1216,14 +1215,98 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
 
 pub fn unlink(p: &Path) -> io::Result<()> {
     let p_u16s = maybe_verbatim(p)?;
-    cvt(unsafe { c::DeleteFileW(p_u16s.as_ptr()) })?;
-    Ok(())
+    if unsafe { c::DeleteFileW(p_u16s.as_ptr()) } == 0 {
+        let err = api::get_last_error();
+        // if `DeleteFileW` fails with ERROR_ACCESS_DENIED then try to remove
+        // the file while ignoring the readonly attribute.
+        // This is accomplished by calling the `posix_delete` function on an open file handle.
+        if err == WinError::ACCESS_DENIED {
+            let mut opts = OpenOptions::new();
+            opts.access_mode(c::DELETE);
+            opts.custom_flags(c::FILE_FLAG_OPEN_REPARSE_POINT);
+            if let Ok(f) = File::open_native(&p_u16s, &opts) {
+                if f.posix_delete().is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+        // return the original error if any of the above fails.
+        Err(io::Error::from_raw_os_error(err.code as i32))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     let old = maybe_verbatim(old)?;
     let new = maybe_verbatim(new)?;
-    cvt(unsafe { c::MoveFileExW(old.as_ptr(), new.as_ptr(), c::MOVEFILE_REPLACE_EXISTING) })?;
+
+    if unsafe { c::MoveFileExW(old.as_ptr(), new.as_ptr(), c::MOVEFILE_REPLACE_EXISTING) } == 0 {
+        let err = api::get_last_error();
+        // if `MoveFileExW` fails with ERROR_ACCESS_DENIED then try to move
+        // the file while ignoring the readonly attribute.
+        // This is accomplished by calling `SetFileInformationByHandle` with `FileRenameInfoEx`.
+        if err == WinError::ACCESS_DENIED {
+            let mut opts = OpenOptions::new();
+            opts.access_mode(c::DELETE);
+            opts.custom_flags(c::FILE_FLAG_OPEN_REPARSE_POINT | c::FILE_FLAG_BACKUP_SEMANTICS);
+            let Ok(f) = File::open_native(&old, &opts) else { return Err(err).io_result() };
+
+            // Calculate the layout of the `FILE_RENAME_INFO` we pass to `SetFileInformation`
+            // This is a dynamically sized struct so we need to get the position of the last field to calculate the actual size.
+            let Ok(new_len_without_nul_in_bytes): Result<u32, _> = ((new.len() - 1) * 2).try_into()
+            else {
+                return Err(err).io_result();
+            };
+            let offset: u32 = offset_of!(c::FILE_RENAME_INFO, FileName).try_into().unwrap();
+            let struct_size = offset + new_len_without_nul_in_bytes + 2;
+            let layout =
+                Layout::from_size_align(struct_size as usize, align_of::<c::FILE_RENAME_INFO>())
+                    .unwrap();
+
+            // SAFETY: We allocate enough memory for a full FILE_RENAME_INFO struct and a filename.
+            let file_rename_info;
+            unsafe {
+                file_rename_info = alloc(layout).cast::<c::FILE_RENAME_INFO>();
+                if file_rename_info.is_null() {
+                    return Err(io::ErrorKind::OutOfMemory.into());
+                }
+
+                (&raw mut (*file_rename_info).Anonymous).write(c::FILE_RENAME_INFO_0 {
+                    Flags: c::FILE_RENAME_FLAG_REPLACE_IF_EXISTS
+                        | c::FILE_RENAME_FLAG_POSIX_SEMANTICS,
+                });
+
+                (&raw mut (*file_rename_info).RootDirectory).write(ptr::null_mut());
+                // Don't include the NULL in the size
+                (&raw mut (*file_rename_info).FileNameLength).write(new_len_without_nul_in_bytes);
+
+                new.as_ptr().copy_to_nonoverlapping(
+                    (&raw mut (*file_rename_info).FileName).cast::<u16>(),
+                    new.len(),
+                );
+            }
+
+            let result = unsafe {
+                c::SetFileInformationByHandle(
+                    f.as_raw_handle(),
+                    c::FileRenameInfoEx,
+                    file_rename_info.cast::<c_void>(),
+                    struct_size,
+                )
+            };
+            unsafe { dealloc(file_rename_info.cast::<u8>(), layout) };
+            if result == 0 {
+                if api::get_last_error() == WinError::DIR_NOT_EMPTY {
+                    return Err(WinError::DIR_NOT_EMPTY).io_result();
+                } else {
+                    return Err(err).io_result();
+                }
+            }
+        } else {
+            return Err(err).io_result();
+        }
+    }
     Ok(())
 }
 
@@ -1305,10 +1388,7 @@ pub fn link(original: &Path, link: &Path) -> io::Result<()> {
 
 #[cfg(target_vendor = "uwp")]
 pub fn link(_original: &Path, _link: &Path) -> io::Result<()> {
-    return Err(io::const_io_error!(
-        io::ErrorKind::Unsupported,
-        "hard link are not supported on UWP",
-    ));
+    return Err(io::const_error!(io::ErrorKind::Unsupported, "hard link are not supported on UWP"));
 }
 
 pub fn stat(path: &Path) -> io::Result<FileAttr> {
@@ -1495,7 +1575,7 @@ pub fn junction_point(original: &Path, link: &Path) -> io::Result<()> {
             let bytes = unsafe { OsStr::from_encoded_bytes_unchecked(&abs_path[2..]) };
             r"\??\UNC\".encode_utf16().chain(bytes.encode_wide()).collect()
         } else {
-            return Err(io::const_io_error!(io::ErrorKind::InvalidInput, "path is not valid"));
+            return Err(io::const_error!(io::ErrorKind::InvalidInput, "path is not valid"));
         }
     };
     // Defined inline so we don't have to mess about with variable length buffer.
@@ -1512,10 +1592,7 @@ pub fn junction_point(original: &Path, link: &Path) -> io::Result<()> {
     }
     let data_len = 12 + (abs_path.len() * 2);
     if data_len > u16::MAX as usize {
-        return Err(io::const_io_error!(
-            io::ErrorKind::InvalidInput,
-            "`original` path is too long"
-        ));
+        return Err(io::const_error!(io::ErrorKind::InvalidInput, "`original` path is too long"));
     }
     let data_len = data_len as u16;
     let mut header = MountPointBuffer {

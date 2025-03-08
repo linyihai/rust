@@ -3,7 +3,7 @@
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
 use clap::{Args, Parser, Subcommand};
-use clippy_dev::{dogfood, fmt, lint, new_lint, serve, setup, update_lints};
+use clippy_dev::{dogfood, fmt, lint, new_lint, release, serve, setup, sync, update_lints, utils};
 use std::convert::Infallible;
 
 fn main() {
@@ -17,15 +17,16 @@ fn main() {
             fix,
             allow_dirty,
             allow_staged,
-        } => dogfood::dogfood(fix, allow_dirty, allow_staged),
+            allow_no_vcs,
+        } => dogfood::dogfood(fix, allow_dirty, allow_staged, allow_no_vcs),
         DevCommand::Fmt { check, verbose } => fmt::run(check, verbose),
         DevCommand::UpdateLints { print_only, check } => {
             if print_only {
                 update_lints::print_lints();
             } else if check {
-                update_lints::update(update_lints::UpdateMode::Check);
+                update_lints::update(utils::UpdateMode::Check);
             } else {
-                update_lints::update(update_lints::UpdateMode::Change);
+                update_lints::update(utils::UpdateMode::Change);
             }
         },
         DevCommand::NewLint {
@@ -34,8 +35,8 @@ fn main() {
             category,
             r#type,
             msrv,
-        } => match new_lint::create(&pass, &name, &category, r#type.as_deref(), msrv) {
-            Ok(()) => update_lints::update(update_lints::UpdateMode::Change),
+        } => match new_lint::create(pass, &name, &category, r#type.as_deref(), msrv) {
+            Ok(()) => update_lints::update(utils::UpdateMode::Change),
             Err(e) => eprintln!("Unable to create lint: {e}"),
         },
         DevCommand::Setup(SetupCommand { subcommand }) => match subcommand {
@@ -53,7 +54,12 @@ fn main() {
                     setup::git_hook::install_hook(force_override);
                 }
             },
-            SetupSubcommand::Toolchain { force, release, name } => setup::toolchain::create(force, release, &name),
+            SetupSubcommand::Toolchain {
+                standalone,
+                force,
+                release,
+                name,
+            } => setup::toolchain::create(standalone, force, release, &name),
             SetupSubcommand::VscodeTasks { remove, force_override } => {
                 if remove {
                     setup::vscode::remove_tasks();
@@ -68,13 +74,19 @@ fn main() {
             RemoveSubcommand::VscodeTasks => setup::vscode::remove_tasks(),
         },
         DevCommand::Serve { port, lint } => serve::run(port, lint),
-        DevCommand::Lint { path, args } => lint::run(&path, args.iter()),
+        DevCommand::Lint { path, edition, args } => lint::run(&path, &edition, args.iter()),
         DevCommand::RenameLint {
             old_name,
             new_name,
             uplift,
         } => update_lints::rename(&old_name, new_name.as_ref().unwrap_or(&old_name), uplift),
         DevCommand::Deprecate { name, reason } => update_lints::deprecate(&name, &reason),
+        DevCommand::Sync(SyncCommand { subcommand }) => match subcommand {
+            SyncSubcommand::UpdateNightly => sync::update_nightly(),
+        },
+        DevCommand::Release(ReleaseCommand { subcommand }) => match subcommand {
+            ReleaseSubcommand::BumpVersion => release::bump_version(),
+        },
     }
 }
 
@@ -100,6 +112,9 @@ enum DevCommand {
         #[arg(long, requires = "fix")]
         /// Fix code even if the working directory has staged changes
         allow_staged: bool,
+        #[arg(long, requires = "fix")]
+        /// Fix code even if a VCS was not detected
+        allow_no_vcs: bool,
     },
     /// Run rustfmt on all projects and tests
     Fmt {
@@ -132,9 +147,9 @@ enum DevCommand {
     #[command(name = "new_lint")]
     /// Create a new lint and run `cargo dev update_lints`
     NewLint {
-        #[arg(short, long, value_parser = ["early", "late"], conflicts_with = "type", default_value = "late")]
+        #[arg(short, long, conflicts_with = "type", default_value = "late")]
         /// Specify whether the lint runs during the early or late pass
-        pass: String,
+        pass: new_lint::Pass,
         #[arg(
             short,
             long,
@@ -200,6 +215,9 @@ enum DevCommand {
     ///     cargo dev lint file.rs -- -W clippy::pedantic {n}
     ///     cargo dev lint ~/my-project -- -- -W clippy::pedantic
     Lint {
+        /// The Rust edition to use
+        #[arg(long, default_value = "2024")]
+        edition: String,
         /// The path to a file or package directory to lint
         path: String,
         /// Pass extra arguments to cargo/clippy-driver
@@ -225,6 +243,10 @@ enum DevCommand {
         /// The reason for deprecation
         reason: String,
     },
+    /// Sync between the rust repo and the Clippy repo
+    Sync(SyncCommand),
+    /// Manage Clippy releases
+    Release(ReleaseCommand),
 }
 
 #[derive(Args)]
@@ -254,14 +276,25 @@ enum SetupSubcommand {
         force_override: bool,
     },
     /// Install a rustup toolchain pointing to the local clippy build
+    ///
+    /// This creates a toolchain with symlinks pointing at
+    /// `target/.../{clippy-driver,cargo-clippy}`, rebuilds of the project will be reflected in the
+    /// created toolchain unless `--standalone` is passed
     Toolchain {
+        #[arg(long, short)]
+        /// Create a standalone toolchain by copying the clippy binaries instead
+        /// of symlinking them
+        ///
+        /// Use this for example to create a toolchain, make a small change and then make another
+        /// toolchain with a different name in order to easily compare the two
+        standalone: bool,
         #[arg(long, short)]
         /// Override an existing toolchain
         force: bool,
         #[arg(long, short)]
         /// Point to --release clippy binary
         release: bool,
-        #[arg(long, default_value = "clippy")]
+        #[arg(long, short, default_value = "clippy")]
         /// Name of the toolchain
         name: String,
     },
@@ -290,4 +323,30 @@ enum RemoveSubcommand {
     GitHook,
     /// Remove the tasks added with 'cargo dev setup vscode-tasks'
     VscodeTasks,
+}
+
+#[derive(Args)]
+struct SyncCommand {
+    #[command(subcommand)]
+    subcommand: SyncSubcommand,
+}
+
+#[derive(Subcommand)]
+enum SyncSubcommand {
+    #[command(name = "update_nightly")]
+    /// Update nightly version in rust-toolchain and `clippy_utils`
+    UpdateNightly,
+}
+
+#[derive(Args)]
+struct ReleaseCommand {
+    #[command(subcommand)]
+    subcommand: ReleaseSubcommand,
+}
+
+#[derive(Subcommand)]
+enum ReleaseSubcommand {
+    #[command(name = "bump_version")]
+    /// Bump the version in the Cargo.toml files
+    BumpVersion,
 }

@@ -2,10 +2,12 @@ use rustc_ast::TraitObjectSyntax;
 use rustc_errors::codes::*;
 use rustc_errors::{Diag, EmissionGuarantee, ErrorGuaranteed, StashKey, Suggestions};
 use rustc_hir as hir;
-use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def::{DefKind, Namespace, Res};
+use rustc_hir::def_id::DefId;
 use rustc_lint_defs::Applicability;
 use rustc_lint_defs::builtin::BARE_TRAIT_OBJECTS;
 use rustc_span::Span;
+use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_trait_selection::error_reporting::traits::suggestions::NextTypeParamName;
 
 use super::HirTyLowerer;
@@ -21,9 +23,12 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     ) -> Option<ErrorGuaranteed> {
         let tcx = self.tcx();
 
-        let hir::TyKind::TraitObject([poly_trait_ref, ..], _, TraitObjectSyntax::None) =
+        let poly_trait_ref = if let hir::TyKind::TraitObject([poly_trait_ref, ..], tagged_ptr) =
             self_ty.kind
-        else {
+            && let TraitObjectSyntax::None = tagged_ptr.tag()
+        {
+            poly_trait_ref
+        } else {
             return None;
         };
 
@@ -36,8 +41,8 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 kind: hir::ExprKind::Path(hir::QPath::TypeRelative(qself, _)),
                 ..
             })
-            | hir::Node::Pat(hir::Pat {
-                kind: hir::PatKind::Path(hir::QPath::TypeRelative(qself, _)),
+            | hir::Node::PatExpr(hir::PatExpr {
+                kind: hir::PatExprKind::Path(hir::QPath::TypeRelative(qself, _)),
                 ..
             }) if qself.hir_id == self_ty.hir_id => true,
             _ => false,
@@ -79,14 +84,19 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 rustc_errors::struct_span_code_err!(self.dcx(), self_ty.span, E0782, "{}", msg);
             if self_ty.span.can_be_used_for_suggestions()
                 && !self.maybe_suggest_impl_trait(self_ty, &mut diag)
+                && !self.maybe_suggest_dyn_trait(self_ty, label, sugg, &mut diag)
             {
-                // FIXME: Only emit this suggestion if the trait is dyn-compatible.
-                diag.multipart_suggestion_verbose(label, sugg, Applicability::MachineApplicable);
+                self.maybe_suggest_add_generic_impl_trait(self_ty, &mut diag);
             }
             // Check if the impl trait that we are considering is an impl of a local trait.
             self.maybe_suggest_blanket_trait_impl(self_ty, &mut diag);
             self.maybe_suggest_assoc_ty_bound(self_ty, &mut diag);
-            // In case there is an associate type with the same name
+            self.maybe_suggest_typoed_method(
+                self_ty,
+                poly_trait_ref.trait_ref.trait_def_id(),
+                &mut diag,
+            );
+            // In case there is an associated type with the same name
             // Add the suggestion to this error
             if let Some(mut sugg) =
                 tcx.dcx().steal_non_err(self_ty.span, StashKey::AssociatedTypeSuggestion)
@@ -96,7 +106,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 s1.append(s2);
                 sugg.cancel();
             }
-            diag.stash(self_ty.span, StashKey::TraitMissingMethod)
+            Some(diag.emit())
         } else {
             tcx.node_span_lint(BARE_TRAIT_OBJECTS, self_ty.hir_id, self_ty.span, |lint| {
                 lint.primary_message("trait objects without an explicit `dyn` are deprecated");
@@ -113,6 +123,33 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         }
     }
 
+    fn maybe_suggest_add_generic_impl_trait(
+        &self,
+        self_ty: &hir::Ty<'_>,
+        diag: &mut Diag<'_>,
+    ) -> bool {
+        let tcx = self.tcx();
+        let msg = "you might be missing a type parameter";
+        let mut sugg = vec![];
+
+        let parent_id = tcx.hir_get_parent_item(self_ty.hir_id).def_id;
+        let parent_item = tcx.hir_node_by_def_id(parent_id).expect_item();
+        match parent_item.kind {
+            hir::ItemKind::Struct(_, generics) | hir::ItemKind::Enum(_, generics) => {
+                sugg.push((
+                    generics.where_clause_span,
+                    format!(
+                        "<T: {}>",
+                        self.tcx().sess.source_map().span_to_snippet(self_ty.span).unwrap()
+                    ),
+                ));
+                sugg.push((self_ty.span, "T".to_string()));
+            }
+            _ => {}
+        }
+        diag.multipart_suggestion_verbose(msg, sugg, Applicability::MachineApplicable);
+        true
+    }
     /// Make sure that we are in the condition to suggest the blanket implementation.
     fn maybe_suggest_blanket_trait_impl<G: EmissionGuarantee>(
         &self,
@@ -120,7 +157,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         diag: &mut Diag<'_, G>,
     ) {
         let tcx = self.tcx();
-        let parent_id = tcx.hir().get_parent_item(self_ty.hir_id).def_id;
+        let parent_id = tcx.hir_get_parent_item(self_ty.hir_id).def_id;
         if let hir::Node::Item(hir::Item {
             kind: hir::ItemKind::Impl(hir::Impl { self_ty: impl_self_ty, of_trait, generics, .. }),
             ..
@@ -161,6 +198,38 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         }
     }
 
+    fn maybe_suggest_dyn_trait(
+        &self,
+        self_ty: &hir::Ty<'_>,
+        label: &str,
+        sugg: Vec<(Span, String)>,
+        diag: &mut Diag<'_>,
+    ) -> bool {
+        let tcx = self.tcx();
+        let parent_id = tcx.hir_get_parent_item(self_ty.hir_id).def_id;
+        let parent_item = tcx.hir_node_by_def_id(parent_id).expect_item();
+
+        // If the parent item is an enum, don't suggest the dyn trait.
+        if let hir::ItemKind::Enum(..) = parent_item.kind {
+            return false;
+        }
+
+        // If the parent item is a struct, check if self_ty is the last field.
+        if let hir::ItemKind::Struct(variant_data, _) = parent_item.kind {
+            if variant_data.fields().last().unwrap().ty.span != self_ty.span {
+                return false;
+            }
+        }
+
+        // FIXME: Only emit this suggestion if the trait is dyn-compatible.
+        diag.multipart_suggestion_verbose(
+            label.to_string(),
+            sugg,
+            Applicability::MachineApplicable,
+        );
+        true
+    }
+
     fn add_generic_param_suggestion(
         &self,
         generics: &hir::Generics<'_>,
@@ -181,7 +250,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     /// Make sure that we are in the condition to suggest `impl Trait`.
     fn maybe_suggest_impl_trait(&self, self_ty: &hir::Ty<'_>, diag: &mut Diag<'_>) -> bool {
         let tcx = self.tcx();
-        let parent_id = tcx.hir().get_parent_item(self_ty.hir_id).def_id;
+        let parent_id = tcx.hir_get_parent_item(self_ty.hir_id).def_id;
         // FIXME: If `type_alias_impl_trait` is enabled, also look for `Trait0<Ty = Trait1>`
         //        and suggest `Trait0<Ty = impl Trait1>`.
         // Functions are found in three different contexts.
@@ -189,9 +258,9 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         // 2. Functions inside trait blocks
         // 3. Functions inside impl blocks
         let (sig, generics) = match tcx.hir_node_by_def_id(parent_id) {
-            hir::Node::Item(hir::Item { kind: hir::ItemKind::Fn(sig, generics, _), .. }) => {
-                (sig, generics)
-            }
+            hir::Node::Item(hir::Item {
+                kind: hir::ItemKind::Fn { sig, generics, .. }, ..
+            }) => (sig, generics),
             hir::Node::TraitItem(hir::TraitItem {
                 kind: hir::TraitItemKind::Fn(sig, _),
                 generics,
@@ -287,7 +356,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 let (dyn_str, paren_dyn_str) =
                     if borrowed { ("dyn ", "(dyn ") } else { ("&dyn ", "&(dyn ") };
 
-                let sugg = if let hir::TyKind::TraitObject([_, _, ..], _, _) = self_ty.kind {
+                let sugg = if let hir::TyKind::TraitObject([_, _, ..], _) = self_ty.kind {
                     // There are more than one trait bound, we need surrounding parentheses.
                     vec![
                         (self_ty.span.shrink_to_lo(), paren_dyn_str.to_string()),
@@ -311,7 +380,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     }
 
     fn maybe_suggest_assoc_ty_bound(&self, self_ty: &hir::Ty<'_>, diag: &mut Diag<'_>) {
-        let mut parents = self.tcx().hir().parent_iter(self_ty.hir_id);
+        let mut parents = self.tcx().hir_parent_iter(self_ty.hir_id);
 
         if let Some((_, hir::Node::AssocItemConstraint(constraint))) = parents.next()
             && let Some(obj_ty) = constraint.ty()
@@ -339,6 +408,46 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 lo.between(hi),
                 "you might have meant to write a bound here",
                 ": ",
+                Applicability::MaybeIncorrect,
+            );
+        }
+    }
+
+    fn maybe_suggest_typoed_method(
+        &self,
+        self_ty: &hir::Ty<'_>,
+        trait_def_id: Option<DefId>,
+        diag: &mut Diag<'_>,
+    ) {
+        let tcx = self.tcx();
+        let Some(trait_def_id) = trait_def_id else {
+            return;
+        };
+        let hir::Node::Expr(hir::Expr {
+            kind: hir::ExprKind::Path(hir::QPath::TypeRelative(path_ty, segment)),
+            ..
+        }) = tcx.parent_hir_node(self_ty.hir_id)
+        else {
+            return;
+        };
+        if path_ty.hir_id != self_ty.hir_id {
+            return;
+        }
+        let names: Vec<_> = tcx
+            .associated_items(trait_def_id)
+            .in_definition_order()
+            .filter(|assoc| assoc.kind.namespace() == Namespace::ValueNS)
+            .map(|cand| cand.name)
+            .collect();
+        if let Some(typo) = find_best_match_for_name(&names, segment.ident.name, None) {
+            diag.span_suggestion_verbose(
+                segment.ident.span,
+                format!(
+                    "you may have misspelled this associated item, causing `{}` \
+                    to be interpreted as a type rather than a trait",
+                    tcx.item_name(trait_def_id),
+                ),
+                typo,
                 Applicability::MaybeIncorrect,
             );
         }

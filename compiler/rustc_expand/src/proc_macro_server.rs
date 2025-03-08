@@ -1,4 +1,5 @@
 use std::ops::{Bound, Range};
+use std::sync::Arc;
 
 use ast::token::IdentIsRaw;
 use pm::bridge::{
@@ -11,15 +12,13 @@ use rustc_ast::tokenstream::{self, DelimSpacing, Spacing, TokenStream};
 use rustc_ast::util::literal::escape_byte_str_symbol;
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::sync::Lrc;
 use rustc_errors::{Diag, ErrorGuaranteed, MultiSpan, PResult};
 use rustc_parse::lexer::nfc_normalize;
 use rustc_parse::parser::Parser;
-use rustc_parse::{new_parser_from_source_str, source_str_to_stream, unwrap_or_emit_fatal};
+use rustc_parse::{exp, new_parser_from_source_str, source_str_to_stream, unwrap_or_emit_fatal};
 use rustc_session::parse::ParseSess;
 use rustc_span::def_id::CrateNum;
-use rustc_span::symbol::{self, Symbol, sym};
-use rustc_span::{BytePos, FileName, Pos, SourceFile, Span};
+use rustc_span::{BytePos, FileName, Pos, SourceFile, Span, Symbol, sym};
 use smallvec::{SmallVec, smallvec};
 
 use crate::base::ExtCtxt;
@@ -38,7 +37,7 @@ impl FromInternal<token::Delimiter> for Delimiter {
             token::Delimiter::Parenthesis => Delimiter::Parenthesis,
             token::Delimiter::Brace => Delimiter::Brace,
             token::Delimiter::Bracket => Delimiter::Bracket,
-            token::Delimiter::Invisible => Delimiter::None,
+            token::Delimiter::Invisible(_) => Delimiter::None,
         }
     }
 }
@@ -49,7 +48,7 @@ impl ToInternal<token::Delimiter> for Delimiter {
             Delimiter::Parenthesis => token::Delimiter::Parenthesis,
             Delimiter::Brace => token::Delimiter::Brace,
             Delimiter::Bracket => token::Delimiter::Bracket,
-            Delimiter::None => token::Delimiter::Invisible,
+            Delimiter::None => token::Delimiter::Invisible(token::InvisibleOrigin::ProcMacro),
         }
     }
 }
@@ -112,9 +111,9 @@ impl FromInternal<(TokenStream, &mut Rustc<'_, '_>)> for Vec<TokenTree<TokenStre
         // Estimate the capacity as `stream.len()` rounded up to the next power
         // of two to limit the number of required reallocations.
         let mut trees = Vec::with_capacity(stream.len().next_power_of_two());
-        let mut cursor = stream.trees();
+        let mut iter = stream.iter();
 
-        while let Some(tree) = cursor.next() {
+        while let Some(tree) = iter.next() {
             let (Token { kind, span }, joint) = match tree.clone() {
                 tokenstream::TokenTree::Delimited(span, _, delim, tts) => {
                     let delimiter = pm::Delimiter::from_internal(delim);
@@ -181,28 +180,28 @@ impl FromInternal<(TokenStream, &mut Rustc<'_, '_>)> for Vec<TokenTree<TokenStre
                 Gt => op(">"),
                 AndAnd => op("&&"),
                 OrOr => op("||"),
-                Not => op("!"),
+                Bang => op("!"),
                 Tilde => op("~"),
-                BinOp(Plus) => op("+"),
-                BinOp(Minus) => op("-"),
-                BinOp(Star) => op("*"),
-                BinOp(Slash) => op("/"),
-                BinOp(Percent) => op("%"),
-                BinOp(Caret) => op("^"),
-                BinOp(And) => op("&"),
-                BinOp(Or) => op("|"),
-                BinOp(Shl) => op("<<"),
-                BinOp(Shr) => op(">>"),
-                BinOpEq(Plus) => op("+="),
-                BinOpEq(Minus) => op("-="),
-                BinOpEq(Star) => op("*="),
-                BinOpEq(Slash) => op("/="),
-                BinOpEq(Percent) => op("%="),
-                BinOpEq(Caret) => op("^="),
-                BinOpEq(And) => op("&="),
-                BinOpEq(Or) => op("|="),
-                BinOpEq(Shl) => op("<<="),
-                BinOpEq(Shr) => op(">>="),
+                Plus => op("+"),
+                Minus => op("-"),
+                Star => op("*"),
+                Slash => op("/"),
+                Percent => op("%"),
+                Caret => op("^"),
+                And => op("&"),
+                Or => op("|"),
+                Shl => op("<<"),
+                Shr => op(">>"),
+                PlusEq => op("+="),
+                MinusEq => op("-="),
+                StarEq => op("*="),
+                SlashEq => op("/="),
+                PercentEq => op("%="),
+                CaretEq => op("^="),
+                AndEq => op("&="),
+                OrEq => op("|="),
+                ShlEq => op("<<="),
+                ShrEq => op(">>="),
                 At => op("@"),
                 Dot => op("."),
                 DotDot => op(".."),
@@ -230,7 +229,7 @@ impl FromInternal<(TokenStream, &mut Rustc<'_, '_>)> for Vec<TokenTree<TokenStre
                 })),
 
                 Lifetime(name, is_raw) => {
-                    let ident = symbol::Ident::new(name, span).without_first_quote();
+                    let ident = rustc_span::Ident::new(name, span).without_first_quote();
                     trees.extend([
                         TokenTree::Punct(Punct { ch: b'\'', joint: true, span }),
                         TokenTree::Ident(Ident { sym: ident.name, is_raw: is_raw.into(), span }),
@@ -323,16 +322,16 @@ impl ToInternal<SmallVec<[tokenstream::TokenTree; 2]>>
                     b'=' => Eq,
                     b'<' => Lt,
                     b'>' => Gt,
-                    b'!' => Not,
+                    b'!' => Bang,
                     b'~' => Tilde,
-                    b'+' => BinOp(Plus),
-                    b'-' => BinOp(Minus),
-                    b'*' => BinOp(Star),
-                    b'/' => BinOp(Slash),
-                    b'%' => BinOp(Percent),
-                    b'^' => BinOp(Caret),
-                    b'&' => BinOp(And),
-                    b'|' => BinOp(Or),
+                    b'+' => Plus,
+                    b'-' => Minus,
+                    b'*' => Star,
+                    b'/' => Slash,
+                    b'%' => Percent,
+                    b'^' => Caret,
+                    b'&' => And,
+                    b'|' => Or,
                     b'@' => At,
                     b'.' => Dot,
                     b',' => Comma,
@@ -373,10 +372,9 @@ impl ToInternal<SmallVec<[tokenstream::TokenTree; 2]>>
                 suffix,
                 span,
             }) if symbol.as_str().starts_with('-') => {
-                let minus = BinOp(BinOpToken::Minus);
                 let symbol = Symbol::intern(&symbol.as_str()[1..]);
                 let integer = TokenKind::lit(token::Integer, symbol, suffix);
-                let a = tokenstream::TokenTree::token_joint_hidden(minus, span);
+                let a = tokenstream::TokenTree::token_joint_hidden(Minus, span);
                 let b = tokenstream::TokenTree::token_alone(integer, span);
                 smallvec![a, b]
             }
@@ -386,10 +384,9 @@ impl ToInternal<SmallVec<[tokenstream::TokenTree; 2]>>
                 suffix,
                 span,
             }) if symbol.as_str().starts_with('-') => {
-                let minus = BinOp(BinOpToken::Minus);
                 let symbol = Symbol::intern(&symbol.as_str()[1..]);
                 let float = TokenKind::lit(token::Float, symbol, suffix);
-                let a = tokenstream::TokenTree::token_joint_hidden(minus, span);
+                let a = tokenstream::TokenTree::token_joint_hidden(Minus, span);
                 let b = tokenstream::TokenTree::token_alone(float, span);
                 smallvec![a, b]
             }
@@ -447,7 +444,7 @@ impl<'a, 'b> Rustc<'a, 'b> {
 impl server::Types for Rustc<'_, '_> {
     type FreeFunctions = FreeFunctions;
     type TokenStream = TokenStream;
-    type SourceFile = Lrc<SourceFile>;
+    type SourceFile = Arc<SourceFile>;
     type Span = Span;
     type Symbol = Symbol;
 }
@@ -474,7 +471,7 @@ impl server::FreeFunctions for Rustc<'_, '_> {
             unwrap_or_emit_fatal(new_parser_from_source_str(self.psess(), name, s.to_owned()));
 
         let first_span = parser.token.span.data();
-        let minus_present = parser.eat(&token::BinOp(token::Minus));
+        let minus_present = parser.eat(exp!(Minus));
 
         let lit_span = parser.token.span.data();
         let token::Literal(mut lit) = parser.token.kind else {
@@ -600,10 +597,7 @@ impl server::TokenStream for Rustc<'_, '_> {
                         Ok(Self::TokenStream::from_iter([
                             // FIXME: The span of the `-` token is lost when
                             // parsing, so we cannot faithfully recover it here.
-                            tokenstream::TokenTree::token_joint_hidden(
-                                token::BinOp(token::Minus),
-                                e.span,
-                            ),
+                            tokenstream::TokenTree::token_joint_hidden(token::Minus, e.span),
                             tokenstream::TokenTree::token_alone(token::Literal(*token_lit), e.span),
                         ]))
                     }
@@ -658,7 +652,7 @@ impl server::TokenStream for Rustc<'_, '_> {
 
 impl server::SourceFile for Rustc<'_, '_> {
     fn eq(&mut self, file1: &Self::SourceFile, file2: &Self::SourceFile) -> bool {
-        Lrc::ptr_eq(file1, file2)
+        Arc::ptr_eq(file1, file2)
     }
 
     fn path(&mut self, file: &Self::SourceFile) -> String {

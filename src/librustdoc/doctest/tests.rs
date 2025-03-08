@@ -316,7 +316,7 @@ let mut input = String::new();
 io::stdin().read_line(&mut input)?;
 Ok::<(), io:Error>(())";
     let expected = "#![allow(unused)]
-fn main() { fn _inner() -> Result<(), impl core::fmt::Debug> {
+fn main() { fn _inner() -> core::result::Result<(), impl core::fmt::Debug> {
 use std::io;
 let mut input = String::new();
 io::stdin().read_line(&mut input)?;
@@ -378,4 +378,26 @@ fn main() {
     .to_string();
     let (output, len) = make_test(input, None, false, &opts, None);
     assert_eq!((output, len), (expected, 1));
+}
+
+#[test]
+fn check_split_args() {
+    fn compare(input: &str, expected: &[&str]) {
+        let output = super::split_args(input);
+        let expected = expected.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(expected, output, "test failed for {input:?}");
+    }
+
+    compare("'a' \"b\"c", &["a", "bc"]);
+    compare("'a' \"b \"c d", &["a", "b c", "d"]);
+    compare("'a' \"b\\\"c\"", &["a", "b\"c"]);
+    compare("'a\"'", &["a\""]);
+    compare("\"a'\"", &["a'"]);
+    compare("\\ a", &[" a"]);
+    compare("\\\\", &["\\"]);
+    compare("a'", &["a"]);
+    compare("a          ", &["a"]);
+    compare("a          b", &["a", "b"]);
+    compare("a\n\t \rb", &["a", "b"]);
+    compare("a\n\t1 \rb", &["a", "1", "b"]);
 }

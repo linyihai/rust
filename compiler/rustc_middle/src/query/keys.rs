@@ -4,8 +4,7 @@ use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE, LocalDefId, LocalModDefId,
 use rustc_hir::hir_id::{HirId, OwnerId};
 use rustc_query_system::dep_graph::DepNodeIndex;
 use rustc_query_system::query::{DefIdCache, DefaultCache, SingleCache, VecCache};
-use rustc_span::symbol::{Ident, Symbol};
-use rustc_span::{DUMMY_SP, Span};
+use rustc_span::{DUMMY_SP, Ident, Span, Symbol};
 
 use crate::infer::canonical::CanonicalQueryInput;
 use crate::mir::mono::CollectionMode;
@@ -21,6 +20,12 @@ pub struct LocalCrate;
 /// The `Key` trait controls what types can legally be used as the key
 /// for a query.
 pub trait Key: Sized {
+    /// The type of in-memory cache to use for queries with this key type.
+    ///
+    /// In practice the cache type must implement [`QueryCache`], though that
+    /// constraint is not enforced here.
+    ///
+    /// [`QueryCache`]: rustc_query_system::query::QueryCache
     // N.B. Most of the keys down below have `type Cache<V> = DefaultCache<Self, V>;`,
     //      it would be reasonable to use associated type defaults, to remove the duplication...
     //
@@ -41,7 +46,8 @@ pub trait Key: Sized {
         None
     }
 
-    fn ty_def_id(&self) -> Option<DefId> {
+    /// Used to detect when ADT def ids are used as keys in a cycle for better error reporting.
+    fn def_id_for_ty_in_cycle(&self) -> Option<DefId> {
         None
     }
 }
@@ -95,7 +101,7 @@ impl<'tcx> Key for mir::interpret::GlobalId<'tcx> {
     }
 }
 
-impl<'tcx> Key for (Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>) {
+impl<'tcx> Key for (Ty<'tcx>, Option<ty::ExistentialTraitRef<'tcx>>) {
     type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
@@ -360,6 +366,14 @@ impl<'tcx> Key for (ty::ParamEnv<'tcx>, ty::TraitRef<'tcx>) {
     }
 }
 
+impl<'tcx> Key for ty::ParamEnvAnd<'tcx, Ty<'tcx>> {
+    type Cache<V> = DefaultCache<Self, V>;
+
+    fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
+        DUMMY_SP
+    }
+}
+
 impl<'tcx> Key for ty::TraitRef<'tcx> {
     type Cache<V> = DefaultCache<Self, V>;
 
@@ -415,7 +429,7 @@ impl<'tcx> Key for Ty<'tcx> {
         DUMMY_SP
     }
 
-    fn ty_def_id(&self) -> Option<DefId> {
+    fn def_id_for_ty_in_cycle(&self) -> Option<DefId> {
         match *self.kind() {
             ty::Adt(adt, _) => Some(adt.did()),
             ty::Coroutine(def_id, ..) => Some(def_id),
@@ -463,8 +477,8 @@ impl<'tcx, T: Key> Key for ty::PseudoCanonicalInput<'tcx, T> {
         self.value.default_span(tcx)
     }
 
-    fn ty_def_id(&self) -> Option<DefId> {
-        self.value.ty_def_id()
+    fn def_id_for_ty_in_cycle(&self) -> Option<DefId> {
+        self.value.def_id_for_ty_in_cycle()
     }
 }
 
@@ -487,6 +501,14 @@ impl Key for Option<Symbol> {
 /// Canonical query goals correspond to abstract trait operations that
 /// are not tied to any crate in particular.
 impl<'tcx, T: Clone> Key for CanonicalQueryInput<'tcx, T> {
+    type Cache<V> = DefaultCache<Self, V>;
+
+    fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
+        DUMMY_SP
+    }
+}
+
+impl<'tcx, T: Clone> Key for (CanonicalQueryInput<'tcx, T>, bool) {
     type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
@@ -542,7 +564,7 @@ impl<'tcx> Key for (ty::Instance<'tcx>, &'tcx ty::List<Ty<'tcx>>) {
     }
 }
 
-impl<'tcx> Key for (Ty<'tcx>, ty::ValTree<'tcx>) {
+impl<'tcx> Key for ty::Value<'tcx> {
     type Cache<V> = DefaultCache<Self, V>;
 
     fn default_span(&self, _: TyCtxt<'_>) -> Span {
@@ -585,7 +607,7 @@ impl<'tcx> Key for (ValidityRequirement, ty::PseudoCanonicalInput<'tcx, Ty<'tcx>
         DUMMY_SP
     }
 
-    fn ty_def_id(&self) -> Option<DefId> {
+    fn def_id_for_ty_in_cycle(&self) -> Option<DefId> {
         match self.1.value.kind() {
             ty::Adt(adt, _) => Some(adt.did()),
             _ => None,

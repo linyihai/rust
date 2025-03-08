@@ -137,6 +137,10 @@ pub(crate) fn format_expr(
         ast::ExprKind::Tup(ref items) => {
             rewrite_tuple(context, items.iter(), expr.span, shape, items.len() == 1)
         }
+        ast::ExprKind::Use(_, _) => {
+            // FIXME: properly implement this
+            Ok(context.snippet(expr.span()).to_owned())
+        }
         ast::ExprKind::Let(ref pat, ref expr, _span, _) => rewrite_let(context, shape, pat, expr),
         ast::ExprKind::If(..)
         | ast::ExprKind::ForLoop { .. }
@@ -413,7 +417,8 @@ pub(crate) fn format_expr(
         ast::ExprKind::FormatArgs(..)
         | ast::ExprKind::Type(..)
         | ast::ExprKind::IncludedBytes(..)
-        | ast::ExprKind::OffsetOf(..) => {
+        | ast::ExprKind::OffsetOf(..)
+        | ast::ExprKind::UnsafeBinderCast(..) => {
             // These don't normally occur in the AST because macros aren't expanded. However,
             // rustfmt tries to parse macro arguments when formatting macros, so it's not totally
             // impossible for rustfmt to come across one of these nodes when formatting a file.

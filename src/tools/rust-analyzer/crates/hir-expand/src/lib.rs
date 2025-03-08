@@ -28,6 +28,7 @@ use rustc_hash::FxHashMap;
 use stdx::TupleExt;
 use triomphe::Arc;
 
+use core::fmt;
 use std::hash::Hash;
 
 use base_db::{ra_salsa::InternValueTrivial, CrateId};
@@ -69,12 +70,17 @@ pub mod tt {
     pub type Delimiter = ::tt::Delimiter<Span>;
     pub type DelimSpan = ::tt::DelimSpan<Span>;
     pub type Subtree = ::tt::Subtree<Span>;
-    pub type SubtreeBuilder = ::tt::SubtreeBuilder<Span>;
     pub type Leaf = ::tt::Leaf<Span>;
     pub type Literal = ::tt::Literal<Span>;
     pub type Punct = ::tt::Punct<Span>;
     pub type Ident = ::tt::Ident<Span>;
     pub type TokenTree = ::tt::TokenTree<Span>;
+    pub type TopSubtree = ::tt::TopSubtree<Span>;
+    pub type TopSubtreeBuilder = ::tt::TopSubtreeBuilder<Span>;
+    pub type TokenTreesView<'a> = ::tt::TokenTreesView<'a, Span>;
+    pub type SubtreeView<'a> = ::tt::SubtreeView<'a, Span>;
+    pub type TtElement<'a> = ::tt::iter::TtElement<'a, Span>;
+    pub type TtIter<'a> = ::tt::iter::TtIter<'a, Span>;
 }
 
 #[macro_export]
@@ -147,6 +153,10 @@ impl ExpandError {
     pub fn span(&self) -> Span {
         self.inner.1
     }
+
+    pub fn render_to_string(&self, db: &dyn ExpandDatabase) -> RenderedExpandError {
+        self.inner.0.render_to_string(db)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
@@ -164,20 +174,22 @@ pub enum ExpandErrorKind {
     ProcMacroPanic(Box<str>),
 }
 
-impl ExpandError {
-    pub fn render_to_string(&self, db: &dyn ExpandDatabase) -> RenderedExpandError {
-        self.inner.0.render_to_string(db)
-    }
-}
-
 pub struct RenderedExpandError {
     pub message: String,
     pub error: bool,
     pub kind: &'static str,
 }
 
+impl fmt::Display for RenderedExpandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
 impl RenderedExpandError {
     const GENERAL_KIND: &str = "macro-error";
+    const DISABLED: &str = "proc-macro-disabled";
+    const ATTR_EXP_DISABLED: &str = "attribute-expansion-disabled";
 }
 
 impl ExpandErrorKind {
@@ -186,12 +198,12 @@ impl ExpandErrorKind {
             ExpandErrorKind::ProcMacroAttrExpansionDisabled => RenderedExpandError {
                 message: "procedural attribute macro expansion is disabled".to_owned(),
                 error: false,
-                kind: "proc-macros-disabled",
+                kind: RenderedExpandError::ATTR_EXP_DISABLED,
             },
             ExpandErrorKind::MacroDisabled => RenderedExpandError {
                 message: "proc-macro is explicitly disabled".to_owned(),
                 error: false,
-                kind: "proc-macro-disabled",
+                kind: RenderedExpandError::DISABLED,
             },
             &ExpandErrorKind::MissingProcMacroExpander(def_crate) => {
                 match db.proc_macros().get_error_for_crate(def_crate) {
@@ -269,10 +281,17 @@ pub enum MacroDefKind {
     ProcMacro(AstId<ast::Fn>, CustomProcMacroExpander, ProcMacroKind),
 }
 
+impl MacroDefKind {
+    #[inline]
+    pub fn is_declarative(&self) -> bool {
+        matches!(self, MacroDefKind::Declarative(..))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EagerCallInfo {
     /// The expanded argument of the eager macro.
-    arg: Arc<tt::Subtree>,
+    arg: Arc<tt::TopSubtree>,
     /// Call id of the eager macro's input file (this is the macro file for its fully expanded input).
     arg_id: MacroCallId,
     error: Option<ExpandError>,
@@ -308,7 +327,7 @@ pub enum MacroCallKind {
         ast_id: AstId<ast::Item>,
         // FIXME: This shouldn't be here, we can derive this from `invoc_attr_index`
         // but we need to fix the `cfg_attr` handling first.
-        attr_args: Option<Arc<tt::Subtree>>,
+        attr_args: Option<Arc<tt::TopSubtree>>,
         /// Syntactical index of the invoking `#[attribute]`.
         ///
         /// Outer attributes are counted first, then inner attributes. This does not support
@@ -397,6 +416,24 @@ impl HirFileIdExt for HirFileId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MacroKind {
+    /// `macro_rules!` or Macros 2.0 macro.
+    Declarative,
+    /// A built-in function-like macro.
+    DeclarativeBuiltIn,
+    /// A custom derive.
+    Derive,
+    /// A builtin-in derive.
+    DeriveBuiltIn,
+    /// A procedural attribute macro.
+    Attr,
+    /// A built-in attribute macro.
+    AttrBuiltIn,
+    /// A function-like procedural macro.
+    ProcMacro,
+}
+
 pub trait MacroFileIdExt {
     fn is_env_or_option_env(&self, db: &dyn ExpandDatabase) -> bool;
     fn is_include_like_macro(&self, db: &dyn ExpandDatabase) -> bool;
@@ -408,15 +445,12 @@ pub trait MacroFileIdExt {
 
     fn expansion_info(self, db: &dyn ExpandDatabase) -> ExpansionInfo;
 
-    fn is_builtin_derive(&self, db: &dyn ExpandDatabase) -> bool;
-    fn is_custom_derive(&self, db: &dyn ExpandDatabase) -> bool;
+    fn kind(&self, db: &dyn ExpandDatabase) -> MacroKind;
 
     /// Return whether this file is an include macro
     fn is_include_macro(&self, db: &dyn ExpandDatabase) -> bool;
 
     fn is_eager(&self, db: &dyn ExpandDatabase) -> bool;
-    /// Return whether this file is an attr macro
-    fn is_attr_macro(&self, db: &dyn ExpandDatabase) -> bool;
 
     /// Return whether this file is the pseudo expansion of the derive attribute.
     /// See [`crate::builtin_attr_macro::derive_attr_expand`].
@@ -449,18 +483,18 @@ impl MacroFileIdExt for MacroFileId {
         ExpansionInfo::new(db, self)
     }
 
-    fn is_custom_derive(&self, db: &dyn ExpandDatabase) -> bool {
-        matches!(
-            db.lookup_intern_macro_call(self.macro_call_id).def.kind,
-            MacroDefKind::ProcMacro(_, _, ProcMacroKind::CustomDerive)
-        )
-    }
-
-    fn is_builtin_derive(&self, db: &dyn ExpandDatabase) -> bool {
-        matches!(
-            db.lookup_intern_macro_call(self.macro_call_id).def.kind,
-            MacroDefKind::BuiltInDerive(..)
-        )
+    fn kind(&self, db: &dyn ExpandDatabase) -> MacroKind {
+        match db.lookup_intern_macro_call(self.macro_call_id).def.kind {
+            MacroDefKind::Declarative(..) => MacroKind::Declarative,
+            MacroDefKind::BuiltIn(..) | MacroDefKind::BuiltInEager(..) => {
+                MacroKind::DeclarativeBuiltIn
+            }
+            MacroDefKind::BuiltInDerive(..) => MacroKind::DeriveBuiltIn,
+            MacroDefKind::ProcMacro(_, _, ProcMacroKind::CustomDerive) => MacroKind::Derive,
+            MacroDefKind::ProcMacro(_, _, ProcMacroKind::Attr) => MacroKind::Attr,
+            MacroDefKind::ProcMacro(_, _, ProcMacroKind::Bang) => MacroKind::ProcMacro,
+            MacroDefKind::BuiltInAttr(..) => MacroKind::AttrBuiltIn,
+        }
     }
 
     fn is_include_macro(&self, db: &dyn ExpandDatabase) -> bool {
@@ -486,13 +520,6 @@ impl MacroFileIdExt for MacroFileId {
             MacroCallKind::FnLike { eager, .. } => eager.as_ref().map(|it| it.arg_id),
             _ => None,
         }
-    }
-
-    fn is_attr_macro(&self, db: &dyn ExpandDatabase) -> bool {
-        matches!(
-            db.lookup_intern_macro_call(self.macro_call_id).def.kind,
-            MacroDefKind::BuiltInAttr(..) | MacroDefKind::ProcMacro(_, _, ProcMacroKind::Attr)
-        )
     }
 
     fn is_derive_attr_pseudo_expansion(&self, db: &dyn ExpandDatabase) -> bool {
@@ -1032,7 +1059,7 @@ impl ExpandTo {
         if parent.kind() == MACRO_EXPR
             && parent
                 .parent()
-                .map_or(false, |p| matches!(p.kind(), EXPR_STMT | STMT_LIST | MACRO_STMTS))
+                .is_some_and(|p| matches!(p.kind(), EXPR_STMT | STMT_LIST | MACRO_STMTS))
         {
             return ExpandTo::Statements;
         }

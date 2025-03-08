@@ -8,8 +8,7 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_expand::base::ExtCtxt;
-use rustc_span::Span;
-use rustc_span::symbol::{Ident, Symbol, sym};
+use rustc_span::{Ident, Span, Symbol, sym};
 use thin_vec::{ThinVec, thin_vec};
 
 pub(super) struct Context<'cx, 'a> {
@@ -298,6 +297,7 @@ impl<'cx, 'a> Context<'cx, 'a> {
             | ExprKind::AssignOp(_, _, _)
             | ExprKind::Gen(_, _, _, _)
             | ExprKind::Await(_, _)
+            | ExprKind::Use(_, _)
             | ExprKind::Block(_, _)
             | ExprKind::Break(_, _)
             | ExprKind::Closure(_)
@@ -323,7 +323,8 @@ impl<'cx, 'a> Context<'cx, 'a> {
             | ExprKind::While(_, _, _)
             | ExprKind::Yeet(_)
             | ExprKind::Become(_)
-            | ExprKind::Yield(_) => {}
+            | ExprKind::Yield(_)
+            | ExprKind::UnsafeBinderCast(..) => {}
         }
     }
 

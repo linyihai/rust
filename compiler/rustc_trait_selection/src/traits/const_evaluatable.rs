@@ -35,7 +35,7 @@ pub fn is_const_evaluatable<'tcx>(
         ty::ConstKind::Param(_)
         | ty::ConstKind::Bound(_, _)
         | ty::ConstKind::Placeholder(_)
-        | ty::ConstKind::Value(_, _)
+        | ty::ConstKind::Value(_)
         | ty::ConstKind::Error(_) => return Ok(()),
         ty::ConstKind::Infer(_) => return Err(NotConstEvaluatable::MentionsInfer),
     };
@@ -79,12 +79,18 @@ pub fn is_const_evaluatable<'tcx>(
                     Err(
                         EvaluateConstErr::EvaluationFailure(e)
                         | EvaluateConstErr::InvalidConstParamTy(e),
-                    ) => Err(NotConstEvaluatable::Error(e.into())),
+                    ) => Err(NotConstEvaluatable::Error(e)),
                     Ok(_) => Ok(()),
                 }
             }
             _ => bug!("unexpected constkind in `is_const_evalautable: {unexpanded_ct:?}`"),
         }
+    } else if tcx.features().min_generic_const_args() {
+        // This is a sanity check to make sure that non-generics consts are checked to
+        // be evaluatable in case they aren't cchecked elsewhere. This will NOT error
+        // if the const uses generics, as desired.
+        crate::traits::evaluate_const(infcx, unexpanded_ct, param_env);
+        Ok(())
     } else {
         let uv = match unexpanded_ct.kind() {
             ty::ConstKind::Unevaluated(uv) => uv,
@@ -140,7 +146,7 @@ pub fn is_const_evaluatable<'tcx>(
             }
             Err(
                 EvaluateConstErr::EvaluationFailure(e) | EvaluateConstErr::InvalidConstParamTy(e),
-            ) => Err(NotConstEvaluatable::Error(e.into())),
+            ) => Err(NotConstEvaluatable::Error(e)),
             Ok(_) => Ok(()),
         }
     }
