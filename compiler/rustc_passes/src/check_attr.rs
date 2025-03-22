@@ -272,6 +272,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                             | sym::forbid
                             | sym::cfg
                             | sym::cfg_attr
+                            | sym::cfg_attr_trace
                             // need to be fixed
                             | sym::cfi_encoding // FIXME(cfi_encoding)
                             | sym::pointee // FIXME(derive_coerce_pointee)
@@ -575,6 +576,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             // conditional compilation
             sym::cfg,
             sym::cfg_attr,
+            sym::cfg_attr_trace,
             // testing (allowed here so better errors can be generated in `rustc_builtin_macros::test`)
             sym::test,
             sym::ignore,
@@ -598,7 +600,6 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             sym::repr,
             // code generation
             sym::cold,
-            sym::target_feature,
             // documentation
             sym::doc,
         ];
@@ -622,6 +623,21 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                             continue;
                         }
                         _ => {}
+                    }
+
+                    if other_attr.has_name(sym::target_feature) {
+                        if !self.tcx.features().naked_functions_target_feature() {
+                            feature_err(
+                                &self.tcx.sess,
+                                sym::naked_functions_target_feature,
+                                other_attr.span(),
+                                "`#[target_feature(/* ... */)]` is currently unstable on `#[naked]` functions",
+                            ).emit();
+
+                            return;
+                        } else {
+                            continue;
+                        }
                     }
 
                     if !ALLOW_LIST.iter().any(|name| other_attr.has_name(*name)) {
@@ -952,8 +968,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             tcx.dcx().emit_err(errors::DocAliasBadLocation { span, attr_str, location });
             return;
         }
-        let item_name = self.tcx.hir_name(hir_id);
-        if item_name == doc_alias {
+        if self.tcx.hir_opt_name(hir_id) == Some(doc_alias) {
             tcx.dcx().emit_err(errors::DocAliasNotAnAlias { span, attr_str });
             return;
         }
@@ -2641,7 +2656,7 @@ impl<'tcx> Visitor<'tcx> for CheckAttrVisitor<'tcx> {
         // only `#[cfg]` and `#[cfg_attr]` are allowed, but it should be removed
         // if we allow more attributes (e.g., tool attributes and `allow/deny/warn`)
         // in where clauses. After that, only `self.check_attributes` should be enough.
-        const ATTRS_ALLOWED: &[Symbol] = &[sym::cfg, sym::cfg_attr];
+        const ATTRS_ALLOWED: &[Symbol] = &[sym::cfg, sym::cfg_attr, sym::cfg_attr_trace];
         let spans = self
             .tcx
             .hir_attrs(where_predicate.hir_id)

@@ -280,11 +280,11 @@ impl<'tcx> TyCtxt<'tcx> {
         })
     }
 
-    pub fn hir_body_param_names(self, id: BodyId) -> impl Iterator<Item = Ident> {
+    pub fn hir_body_param_names(self, id: BodyId) -> impl Iterator<Item = Option<Ident>> {
         self.hir_body(id).params.iter().map(|param| match param.pat.kind {
-            PatKind::Binding(_, _, ident, _) => ident,
-            PatKind::Wild => Ident::new(kw::Underscore, param.pat.span),
-            _ => Ident::empty(),
+            PatKind::Binding(_, _, ident, _) => Some(ident),
+            PatKind::Wild => Some(Ident::new(kw::Underscore, param.pat.span)),
+            _ => None,
         })
     }
 
@@ -1176,15 +1176,14 @@ pub(super) fn crate_hash(tcx: TyCtxt<'_>, _: LocalCrate) -> Svh {
         debugger_visualizers.hash_stable(&mut hcx, &mut stable_hasher);
         if tcx.sess.opts.incremental.is_some() {
             let definitions = tcx.untracked().definitions.freeze();
-            let mut owner_spans: Vec<_> = krate
-                .owners
-                .iter_enumerated()
-                .filter_map(|(def_id, info)| {
-                    let _ = info.as_owner()?;
+            let mut owner_spans: Vec<_> = tcx
+                .hir_crate_items(())
+                .definitions()
+                .map(|def_id| {
                     let def_path_hash = definitions.def_path_hash(def_id);
                     let span = tcx.source_span(def_id);
                     debug_assert_eq!(span.parent(), None);
-                    Some((def_path_hash, span))
+                    (def_path_hash, span)
                 })
                 .collect();
             owner_spans.sort_unstable_by_key(|bn| bn.0);
